@@ -93,4 +93,22 @@ INSERT INTO threads VALUES (
     1700000009100
 );
 
+INSERT INTO threads VALUES (
+    'nonlocal-1',
+    '/tmp/codex-fixture/rollouts/nonlocal-1.jsonl',
+    1700000010000,
+    1700000011000,
+    'cloud',
+    '/tmp/codex-fixture/nonlocal-workspace',
+    'Non-local fixture',
+    0,
+    NULL,
+    NULL,
+    NULL,
+    1700000011100
+);
+
 INSERT INTO thread_spawn_edges VALUES ('cli-1', 'subagent-1');
+INSERT INTO thread_spawn_edges VALUES ('archived-1', 'subagent-1');
+INSERT INTO thread_spawn_edges VALUES ('missing-parent', 'subagent-1');
+INSERT INTO thread_spawn_edges VALUES ('nonlocal-1', 'subagent-1');

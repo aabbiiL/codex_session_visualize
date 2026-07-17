@@ -83,6 +83,7 @@ final class StateDatabaseSourceTests: XCTestCase {
         XCTAssertEqual(source.id, .stateDatabase)
         XCTAssertEqual(Set(sessionsByID.keys), ["desktop-1", "cli-1", "ide-1", "subagent-1"])
         XCTAssertNil(sessionsByID["archived-1"])
+        XCTAssertNil(sessionsByID["nonlocal-1"])
         XCTAssertEqual(sessionsByID["desktop-1"]?.surface, .desktop)
         XCTAssertEqual(sessionsByID["cli-1"]?.surface, .cli)
         XCTAssertEqual(sessionsByID["ide-1"]?.surface, .ide)
@@ -96,6 +97,12 @@ final class StateDatabaseSourceTests: XCTestCase {
         XCTAssertEqual(result.spawnRelationships.count, 1)
         XCTAssertEqual(result.spawnRelationships.first?.parentSessionID, "cli-1")
         XCTAssertEqual(result.spawnRelationships.first?.childSessionID, "subagent-1")
+        XCTAssertTrue(
+            result.spawnRelationships.allSatisfy {
+                sessionsByID[$0.parentSessionID] != nil
+                    && sessionsByID[$0.childSessionID] != nil
+            }
+        )
         XCTAssertEqual(result.health.status, .healthy)
         XCTAssertTrue(result.health.issues.isEmpty)
         XCTAssertNotNil(result.cursor)
@@ -215,7 +222,7 @@ final class StateDatabaseSourceTests: XCTestCase {
         )
     }
 
-    func testLockedDatabaseReturnsTypedIssueInsteadOfThrowingOrCrashing() async throws {
+    func testLockedStateDatabaseReturnsTypedIssueInsteadOfThrowingOrCrashing() async throws {
         let fixture = try makeDataRoot()
         defer { fixture.remove() }
         try materializeFixture(named: "state-v5", at: fixture.stateDatabaseURL)
@@ -229,6 +236,23 @@ final class StateDatabaseSourceTests: XCTestCase {
         XCTAssertEqual(
             result.health.issues,
             [.lockedDatabase(path: fixture.stateDatabaseURL.path)]
+        )
+    }
+
+    func testLockedGoalDatabaseReturnsTypedIssueInsteadOfThrowingOrCrashing() async throws {
+        let fixture = try makeDataRoot()
+        defer { fixture.remove() }
+        try materializeFixture(named: "goals-v1", at: fixture.goalDatabaseURL)
+        let lock = try SQLiteExclusiveLock(databaseURL: fixture.goalDatabaseURL)
+        defer { lock.release() }
+
+        let result = await GoalDatabaseSource(dataRoot: fixture.root).poll(since: nil)
+
+        XCTAssertTrue(result.goals.isEmpty)
+        XCTAssertEqual(result.health.status, .degraded)
+        XCTAssertEqual(
+            result.health.issues,
+            [.lockedDatabase(path: fixture.goalDatabaseURL.path)]
         )
     }
 
