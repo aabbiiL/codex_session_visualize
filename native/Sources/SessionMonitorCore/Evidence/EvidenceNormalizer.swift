@@ -74,7 +74,8 @@ public struct EvidenceNormalizer: Sendable {
 
         let triggeringEvent = latestEvent(in: events)
         let sources = triggeringEvent?.evidence.sources ?? []
-        let conflictingSources = triggeringEvent.flatMap { event in
+        let conflictingSources: [EvidenceSource] = triggeringEvent.flatMap {
+            event -> [EvidenceSource]? in
             guard event.kind.isTerminal else {
                 return nil
             }
