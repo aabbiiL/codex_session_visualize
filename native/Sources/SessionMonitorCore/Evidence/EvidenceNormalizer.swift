@@ -1,0 +1,276 @@
+import Foundation
+
+public struct RawSourceEvent: Codable, Hashable, Sendable {
+    public let sessionID: String
+    public let turnID: String?
+    public let itemID: String?
+    public let kind: ObservedEvent.Kind
+    public let eventTime: Date
+    public let observedAt: Date
+    public let source: EvidenceSource
+    public let structuredPlan: StructuredPlanPayload?
+
+    public init(
+        sessionID: String,
+        turnID: String?,
+        itemID: String?,
+        kind: ObservedEvent.Kind,
+        eventTime: Date,
+        observedAt: Date,
+        source: EvidenceSource,
+        structuredPlan: StructuredPlanPayload?
+    ) {
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.itemID = itemID
+        self.kind = kind
+        self.eventTime = eventTime
+        self.observedAt = observedAt
+        self.source = source
+        self.structuredPlan = structuredPlan
+    }
+}
+
+public struct EvidenceAssessment: Codable, Hashable, Sendable {
+    public let grade: EvidenceGrade
+    public let sources: [EvidenceSource]
+    public let conflictingSources: [EvidenceSource]
+
+    public init(
+        grade: EvidenceGrade,
+        sources: [EvidenceSource],
+        conflictingSources: [EvidenceSource]
+    ) {
+        self.grade = grade
+        self.sources = sources
+        self.conflictingSources = conflictingSources
+    }
+
+    public var canTriggerBlockedNotification: Bool {
+        conflictingSources.isEmpty && (grade == .high || grade == .medium)
+    }
+}
+
+public struct EvidenceNormalizationResult: Codable, Hashable, Sendable {
+    public let events: [ObservedEvent]
+    public let assessment: EvidenceAssessment
+
+    public init(events: [ObservedEvent], assessment: EvidenceAssessment) {
+        self.events = events
+        self.assessment = assessment
+    }
+}
+
+public struct EvidenceNormalizer: Sendable {
+    public init() {}
+
+    public func normalize(_ rawEvents: [RawSourceEvent]) -> EvidenceNormalizationResult {
+        let conflictsByIdentity = terminalConflicts(in: rawEvents)
+        let grouped = Dictionary(grouping: rawEvents, by: DeduplicationKey.init)
+
+        let events = grouped.values.map { group in
+            normalize(group, conflictsByIdentity: conflictsByIdentity)
+        }.sorted(by: eventPrecedes)
+
+        let sources = orderedSources(rawEvents.map(\.source))
+        let conflictingSources = orderedSources(
+            conflictsByIdentity.values.flatMap { $0 }
+        )
+        let grade = conflictingSources.isEmpty ? grade(for: sources) : .unknown
+
+        return EvidenceNormalizationResult(
+            events: events,
+            assessment: EvidenceAssessment(
+                grade: grade,
+                sources: sources,
+                conflictingSources: conflictingSources
+            )
+        )
+    }
+
+    private func normalize(
+        _ group: [RawSourceEvent],
+        conflictsByIdentity: [EventIdentityKey: [EvidenceSource]]
+    ) -> ObservedEvent {
+        let canonical = canonicalEvent(in: group)
+        let corroboratingSources = orderedSources(group.map(\.source))
+        let identity = EventIdentityKey(canonical)
+        let conflictingSources = canonical.kind.isTerminal
+            ? conflictsByIdentity[identity]
+            : nil
+        let evidenceSources = conflictingSources ?? corroboratingSources
+        let evidenceGrade: EvidenceGrade = conflictingSources == nil
+            ? grade(for: corroboratingSources)
+            : .unknown
+        let planCompletion = canonical.structuredPlan.flatMap {
+            PlanProgressExtractor().extract(from: .structured($0))
+        }
+
+        return ObservedEvent(
+            sessionID: canonical.sessionID,
+            turnID: canonical.turnID,
+            itemID: canonical.itemID,
+            kind: canonical.kind,
+            eventTime: canonical.eventTime,
+            observedAt: canonical.observedAt,
+            evidence: Evidence(grade: evidenceGrade, sources: evidenceSources),
+            planCompletion: planCompletion
+        )
+    }
+
+    private func canonicalEvent(in group: [RawSourceEvent]) -> RawSourceEvent {
+        group.enumerated().min { left, right in
+            let leftRank = sourceTier(left.element.source)
+            let rightRank = sourceTier(right.element.source)
+            if leftRank != rightRank {
+                return leftRank < rightRank
+            }
+            if left.element.observedAt != right.element.observedAt {
+                return left.element.observedAt > right.element.observedAt
+            }
+            if left.element.eventTime != right.element.eventTime {
+                return left.element.eventTime > right.element.eventTime
+            }
+            return left.offset < right.offset
+        }!.element
+    }
+
+    private func terminalConflicts(
+        in rawEvents: [RawSourceEvent]
+    ) -> [EventIdentityKey: [EvidenceSource]] {
+        let terminalEvents = rawEvents.filter { $0.kind.isTerminal }
+        let grouped = Dictionary(grouping: terminalEvents, by: EventIdentityKey.init)
+
+        return grouped.reduce(into: [:]) { result, entry in
+            let distinctKinds = Set(entry.value.map(\.kind))
+            guard distinctKinds.count > 1 else {
+                return
+            }
+            result[entry.key] = orderedSources(entry.value.map(\.source))
+        }
+    }
+
+    private func grade(for sources: [EvidenceSource]) -> EvidenceGrade {
+        guard let strongest = sources.min(by: { sourceTier($0) < sourceTier($1) }) else {
+            return .unknown
+        }
+
+        switch strongest {
+        case .appServer:
+            return .high
+        case .stateDatabase, .rollout, .desktopLog:
+            return .medium
+        case .processProbe, .networkProbe:
+            return .low
+        }
+    }
+
+    private func orderedSources(_ sources: [EvidenceSource]) -> [EvidenceSource] {
+        Array(Set(sources)).sorted { left, right in
+            sourceOrder(left) < sourceOrder(right)
+        }
+    }
+
+    private func sourceTier(_ source: EvidenceSource) -> Int {
+        switch source {
+        case .appServer:
+            return 0
+        case .stateDatabase:
+            return 1
+        case .rollout, .desktopLog:
+            return 2
+        case .processProbe, .networkProbe:
+            return 3
+        }
+    }
+
+    private func sourceOrder(_ source: EvidenceSource) -> Int {
+        switch source {
+        case .appServer:
+            return 0
+        case .stateDatabase:
+            return 1
+        case .rollout:
+            return 2
+        case .desktopLog:
+            return 3
+        case .processProbe:
+            return 4
+        case .networkProbe:
+            return 5
+        }
+    }
+
+    private func eventPrecedes(_ left: ObservedEvent, _ right: ObservedEvent) -> Bool {
+        if left.eventTime != right.eventTime {
+            return left.eventTime < right.eventTime
+        }
+        if left.sessionID != right.sessionID {
+            return left.sessionID < right.sessionID
+        }
+        if left.turnID != right.turnID {
+            return (left.turnID ?? "") < (right.turnID ?? "")
+        }
+        if left.itemID != right.itemID {
+            return (left.itemID ?? "") < (right.itemID ?? "")
+        }
+        return semanticKindRank(left.kind) < semanticKindRank(right.kind)
+    }
+
+    private func semanticKindRank(_ kind: ObservedEvent.Kind) -> String {
+        switch kind {
+        case .turnStarted:
+            return "00"
+        case .modelActivity:
+            return "01"
+        case let .toolStarted(processID):
+            return "02-\(processID)"
+        case let .processAlive(processID):
+            return "03-\(processID)"
+        case .waitingForApproval:
+            return "04"
+        case .waitingForUser:
+            return "05"
+        case .contextCompaction:
+            return "06"
+        case .transportRetry:
+            return "07"
+        case .completed:
+            return "08"
+        case .failed:
+            return "09"
+        case .interrupted:
+            return "10"
+        }
+    }
+}
+
+private struct DeduplicationKey: Hashable {
+    let sessionID: String
+    let turnID: String?
+    let itemID: String?
+    let semanticKind: ObservedEvent.Kind
+    let roundedEventSecond: Int64
+
+    init(_ event: RawSourceEvent) {
+        sessionID = event.sessionID
+        turnID = event.turnID
+        itemID = event.itemID
+        semanticKind = event.kind
+        roundedEventSecond = Int64(event.eventTime.timeIntervalSince1970.rounded())
+    }
+}
+
+private struct EventIdentityKey: Hashable {
+    let sessionID: String
+    let turnID: String?
+    let itemID: String?
+    let roundedEventSecond: Int64
+
+    init(_ event: RawSourceEvent) {
+        sessionID = event.sessionID
+        turnID = event.turnID
+        itemID = event.itemID
+        roundedEventSecond = Int64(event.eventTime.timeIntervalSince1970.rounded())
+    }
+}
