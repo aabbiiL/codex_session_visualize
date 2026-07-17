@@ -220,6 +220,138 @@ final class EvidenceNormalizerTests: XCTestCase {
             )
         }
     }
+
+    func testSameSecondNonterminalTriggerDoesNotInheritTerminalConflictSources() {
+        let result = normalizer.normalize([
+            .fixture(
+                kind: .completed,
+                source: .appServer,
+                eventTime: base.addingTimeInterval(0.10),
+                observedAt: base.addingTimeInterval(1)
+            ),
+            .fixture(
+                kind: .failed,
+                source: .stateDatabase,
+                eventTime: base.addingTimeInterval(0.20),
+                observedAt: base.addingTimeInterval(2)
+            ),
+            .fixture(
+                kind: .modelActivity,
+                source: .processProbe,
+                eventTime: base.addingTimeInterval(0.30),
+                observedAt: base.addingTimeInterval(3)
+            ),
+        ])
+
+        let terminalEvents = result.events.filter { event in
+            switch event.kind {
+            case .completed, .failed, .interrupted:
+                return true
+            default:
+                return false
+            }
+        }
+        XCTAssertEqual(terminalEvents.count, 2)
+        for event in terminalEvents {
+            XCTAssertEqual(event.evidence.grade, .unknown)
+            XCTAssertEqual(event.evidence.sources, [.appServer, .stateDatabase])
+        }
+
+        XCTAssertEqual(result.events.last?.kind, .modelActivity)
+        XCTAssertEqual(result.assessment.grade, .low)
+        XCTAssertEqual(result.assessment.sources, [.processProbe])
+        XCTAssertEqual(result.assessment.conflictingSources, [])
+        XCTAssertFalse(result.assessment.canTriggerBlockedNotification)
+    }
+
+    func testNilTurnIDSortsBeforeEmptyTurnIDIndependentOfInputOrder() {
+        let nilTurn = RawSourceEvent.fixture(
+            kind: .modelActivity,
+            source: .appServer,
+            observedAt: base,
+            turnID: nil
+        )
+        let emptyTurn = RawSourceEvent.fixture(
+            kind: .modelActivity,
+            source: .processProbe,
+            observedAt: base,
+            turnID: ""
+        )
+
+        assertOptionalIdentifierOrder(
+            firstResult: normalizer.normalize([nilTurn, emptyTurn]),
+            reversedResult: normalizer.normalize([emptyTurn, nilTurn]),
+            identifiers: { $0.turnID }
+        )
+    }
+
+    func testNilItemIDSortsBeforeEmptyItemIDIndependentOfInputOrder() {
+        let nilItem = RawSourceEvent.fixture(
+            kind: .modelActivity,
+            source: .appServer,
+            observedAt: base,
+            itemID: nil
+        )
+        let emptyItem = RawSourceEvent.fixture(
+            kind: .modelActivity,
+            source: .processProbe,
+            observedAt: base,
+            itemID: ""
+        )
+
+        assertOptionalIdentifierOrder(
+            firstResult: normalizer.normalize([nilItem, emptyItem]),
+            reversedResult: normalizer.normalize([emptyItem, nilItem]),
+            identifiers: { $0.itemID }
+        )
+    }
+
+    func testHigherTierCanonicalStructuredPlanWinsOverNewerLowerTierPlan() {
+        let higherPlan = StructuredPlanPayload(steps: [
+            StructuredPlanStep(status: "completed"),
+        ])
+        let lowerPlan = StructuredPlanPayload(steps: [
+            StructuredPlanStep(status: "pending"),
+            StructuredPlanStep(status: "pending"),
+        ])
+        let result = normalizer.normalize([
+            .fixture(
+                kind: .modelActivity,
+                source: .appServer,
+                eventTime: base.addingTimeInterval(0.10),
+                observedAt: base.addingTimeInterval(1),
+                structuredPlan: higherPlan
+            ),
+            .fixture(
+                kind: .modelActivity,
+                source: .processProbe,
+                eventTime: base.addingTimeInterval(0.20),
+                observedAt: base.addingTimeInterval(100),
+                structuredPlan: lowerPlan
+            ),
+        ])
+
+        XCTAssertEqual(result.events.count, 1)
+        XCTAssertEqual(
+            result.events.first?.planCompletion,
+            PlanCompletion(completed: 1, total: 1)
+        )
+    }
+
+    private func assertOptionalIdentifierOrder(
+        firstResult: EvidenceNormalizationResult,
+        reversedResult: EvidenceNormalizationResult,
+        identifiers: (ObservedEvent) -> String?
+    ) {
+        for result in [firstResult, reversedResult] {
+            XCTAssertEqual(result.events.count, 2)
+            XCTAssertNil(identifiers(result.events[0]))
+            XCTAssertEqual(identifiers(result.events[1]), "")
+            XCTAssertEqual(result.assessment.grade, .low)
+            XCTAssertEqual(result.assessment.sources, [.processProbe])
+            XCTAssertFalse(result.assessment.canTriggerBlockedNotification)
+        }
+    }
 }
 
 private extension RawSourceEvent {
@@ -230,7 +362,8 @@ private extension RawSourceEvent {
         observedAt: Date? = nil,
         sessionID: String = "session-1",
         turnID: String? = "turn-1",
-        itemID: String? = "item-1"
+        itemID: String? = "item-1",
+        structuredPlan: StructuredPlanPayload? = nil
     ) -> RawSourceEvent {
         RawSourceEvent(
             sessionID: sessionID,
@@ -240,7 +373,7 @@ private extension RawSourceEvent {
             eventTime: eventTime,
             observedAt: observedAt ?? eventTime,
             source: source,
-            structuredPlan: nil
+            structuredPlan: structuredPlan
         )
     }
 }
