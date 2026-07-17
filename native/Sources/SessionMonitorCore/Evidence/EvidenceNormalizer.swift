@@ -72,11 +72,12 @@ public struct EvidenceNormalizer: Sendable {
             normalize(group, conflictsByIdentity: conflictsByIdentity)
         }.sorted(by: eventPrecedes)
 
-        let sources = orderedSources(rawEvents.map(\.source))
-        let conflictingSources = orderedSources(
-            conflictsByIdentity.values.flatMap { $0 }
-        )
-        let grade = conflictingSources.isEmpty ? grade(for: sources) : .unknown
+        let triggeringEvent = latestEvent(in: events)
+        let sources = triggeringEvent?.evidence.sources ?? []
+        let conflictingSources = triggeringEvent.flatMap { event in
+            conflictsByIdentity[EventIdentityKey(event)]
+        } ?? []
+        let grade = triggeringEvent?.evidence.grade ?? .unknown
 
         return EvidenceNormalizationResult(
             events: events,
@@ -217,6 +218,18 @@ public struct EvidenceNormalizer: Sendable {
         return semanticKindRank(left.kind) < semanticKindRank(right.kind)
     }
 
+    private func latestEvent(in events: [ObservedEvent]) -> ObservedEvent? {
+        events.enumerated().max { left, right in
+            if left.element.eventTime != right.element.eventTime {
+                return left.element.eventTime < right.element.eventTime
+            }
+            if left.element.observedAt != right.element.observedAt {
+                return left.element.observedAt < right.element.observedAt
+            }
+            return left.offset < right.offset
+        }?.element
+    }
+
     private func semanticKindRank(_ kind: ObservedEvent.Kind) -> String {
         switch kind {
         case .turnStarted:
@@ -268,6 +281,13 @@ private struct EventIdentityKey: Hashable {
     let roundedEventSecond: Int64
 
     init(_ event: RawSourceEvent) {
+        sessionID = event.sessionID
+        turnID = event.turnID
+        itemID = event.itemID
+        roundedEventSecond = Int64(event.eventTime.timeIntervalSince1970.rounded())
+    }
+
+    init(_ event: ObservedEvent) {
         sessionID = event.sessionID
         turnID = event.turnID
         itemID = event.itemID
