@@ -358,56 +358,48 @@ public struct PostureEngine: Sendable {
     }
 
     private func latestEvent(in events: [ObservedEvent]) -> ObservedEvent? {
-        events.enumerated().max { left, right in
-            if left.element.eventTime != right.element.eventTime {
-                return left.element.eventTime < right.element.eventTime
-            }
-            if left.element.observedAt != right.element.observedAt {
-                return left.element.observedAt < right.element.observedAt
-            }
-            return left.offset < right.offset
-        }?.element
+        indexedEvents(in: events)
+            .max { eventPrecedes($0, $1) }?
+            .event
     }
 
     private func latestPlanCompletion(in events: [ObservedEvent]) -> PlanCompletion? {
-        events
-            .filter { $0.planCompletion != nil }
-            .max { left, right in
-                if left.eventTime != right.eventTime {
-                    return left.eventTime < right.eventTime
-                }
-                return left.observedAt < right.observedAt
-            }?
+        indexedEvents(in: events)
+            .filter { $0.event.planCompletion != nil }
+            .max { eventPrecedes($0, $1) }?
+            .event
             .planCompletion
     }
 
     private func latestActiveTool(in events: [ObservedEvent]) -> ActiveTool? {
-        let starts = events.compactMap { event -> (ObservedEvent, Int32)? in
-            guard case let .toolStarted(processID) = event.kind else {
+        let orderedEvents = indexedEvents(in: events)
+        let starts = orderedEvents.compactMap { indexedEvent -> (IndexedEvent, Int32)? in
+            guard case let .toolStarted(processID) = indexedEvent.event.kind else {
                 return nil
             }
-            return (event, processID)
+            return (indexedEvent, processID)
         }
-        guard let latestStart = starts.max(by: { eventOccursAfter($1.0, $0.0) }) else {
+        guard let latestStart = starts.max(by: { eventPrecedes($0.0, $1.0) }) else {
             return nil
         }
 
-        let wasSuperseded = events.contains { event in
-            eventSupersedesTool(event.kind)
-                && eventOccursAfter(event, latestStart.0)
+        let wasSuperseded = orderedEvents.contains { indexedEvent in
+            eventSupersedesTool(indexedEvent.event.kind)
+                && eventOccursAfter(indexedEvent, latestStart.0)
         }
         if wasSuperseded {
             return nil
         }
 
-        let liveness = events.filter { event in
-            guard case let .processAlive(processID) = event.kind else {
+        let liveness = orderedEvents.filter { indexedEvent in
+            guard case let .processAlive(processID) = indexedEvent.event.kind else {
                 return false
             }
-            return processID == latestStart.1 && event.eventTime >= latestStart.0.eventTime
-        }.max { eventOccursAfter($1, $0) }
+            return processID == latestStart.1
+                && eventOccursAfter(indexedEvent, latestStart.0)
+        }.max { eventPrecedes($0, $1) }
 
-        return ActiveTool(started: latestStart.0, liveness: liveness)
+        return ActiveTool(started: latestStart.0.event, liveness: liveness?.event)
     }
 
     private func eventSupersedesTool(_ kind: ObservedEvent.Kind) -> Bool {
@@ -427,11 +419,24 @@ public struct PostureEngine: Sendable {
         }
     }
 
-    private func eventOccursAfter(_ event: ObservedEvent, _ reference: ObservedEvent) -> Bool {
-        if event.eventTime != reference.eventTime {
-            return event.eventTime > reference.eventTime
+    private func indexedEvents(in events: [ObservedEvent]) -> [IndexedEvent] {
+        events.enumerated().map { offset, event in
+            IndexedEvent(offset: offset, event: event)
         }
-        return event.observedAt > reference.observedAt
+    }
+
+    private func eventPrecedes(_ left: IndexedEvent, _ right: IndexedEvent) -> Bool {
+        if left.event.eventTime != right.event.eventTime {
+            return left.event.eventTime < right.event.eventTime
+        }
+        if left.event.observedAt != right.event.observedAt {
+            return left.event.observedAt < right.event.observedAt
+        }
+        return left.offset < right.offset
+    }
+
+    private func eventOccursAfter(_ event: IndexedEvent, _ reference: IndexedEvent) -> Bool {
+        eventPrecedes(reference, event)
     }
 
     private func combinedToolEvidence(
@@ -465,4 +470,9 @@ public struct PostureEngine: Sendable {
 private struct ActiveTool {
     let started: ObservedEvent
     let liveness: ObservedEvent?
+}
+
+private struct IndexedEvent {
+    let offset: Int
+    let event: ObservedEvent
 }
