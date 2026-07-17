@@ -1,3 +1,11 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "codex-session-monitor": {
+      "title": "Codex Session Monitor",
+      "description": "Read-only posture and health monitoring for local Codex sessions.",
+      "cwd": ".",
+      "command": "./assets/bin/codex-session-monitor-arm64",
+      "args": ["mcp"]
+    }
+  }
 }

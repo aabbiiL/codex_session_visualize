@@ -1,19 +1,17 @@
 {
   "name": "codex-session-monitor",
   "version": "0.1.0",
-  "description": "Codex Session Monitor plugin",
-  "author": {
-    "name": "Local developer"
-  },
+  "description": "Evidence-backed monitoring for local Codex sessions.",
+  "author": { "name": "Loulingbo" },
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Codex Session Monitor",
-    "shortDescription": "Use Codex Session Monitor in Codex.",
-    "longDescription": "Codex Session Monitor adds a local Codex plugin scaffold.",
-    "developerName": "Local developer",
+    "displayName": "Codex Session Monitor（Codex 任务监控器）",
+    "shortDescription": "Monitor local Codex session posture.",
+    "longDescription": "Privacy-safe, read-only posture and health monitoring for local Codex Desktop, CLI, IDE, and sub-agent sessions.",
+    "developerName": "Loulingbo",
     "category": "Productivity",
-    "capabilities": [],
-    "defaultPrompt": "Help me use Codex Session Monitor."
-  },
-  "mcpServers": "./.mcp.json"
+    "capabilities": ["Read"],
+    "defaultPrompt": "Show which local Codex sessions need attention and why."
+  }
 }

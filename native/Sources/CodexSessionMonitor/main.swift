@@ -1,1 +1,4 @@
-print("codex-session-monitor bootstrap")
+import Foundation
+import SessionMonitorCore
+
+print("codex-session-monitor \(BuildInfo.version)")
