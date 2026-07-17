@@ -50,6 +50,76 @@ final class PrivacyPolicyTests: XCTestCase {
         XCTAssertFalse(json.contains("workspacePath"))
     }
 
+    func testHMACWorkspaceProviderRejectsKeysShorterThanThirtyTwoBytes() {
+        XCTAssertThrowsError(
+            try HMACWorkspaceNumberProvider(
+                keyProvider: StubWorkspaceHMACKeyProvider(
+                    key: Data(repeating: 0xA5, count: 31)
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? WorkspaceHMACProviderError, .keyTooShort)
+        }
+    }
+
+    func testHMACWorkspaceNumberIsStableForTheSameKeyAndPath() throws {
+        let keyProvider = StubWorkspaceHMACKeyProvider(
+            key: Data(repeating: 0xA5, count: 32)
+        )
+        let firstProvider = try HMACWorkspaceNumberProvider(keyProvider: keyProvider)
+        let secondProvider = try HMACWorkspaceNumberProvider(keyProvider: keyProvider)
+        let path = "/Users/example/stable-workspace"
+
+        XCTAssertEqual(
+            firstProvider.anonymousWorkspaceNumber(forWorkspacePath: path),
+            secondProvider.anonymousWorkspaceNumber(forWorkspacePath: path)
+        )
+    }
+
+    func testHMACWorkspaceNumberDependsOnBothKeyAndPath() throws {
+        let firstProvider = try HMACWorkspaceNumberProvider(
+            keyProvider: StubWorkspaceHMACKeyProvider(
+                key: Data(repeating: 0x11, count: 32)
+            )
+        )
+        let secondProvider = try HMACWorkspaceNumberProvider(
+            keyProvider: StubWorkspaceHMACKeyProvider(
+                key: Data(repeating: 0x22, count: 32)
+            )
+        )
+        let firstPath = "/Users/example/workspace-a"
+        let secondPath = "/Users/example/workspace-b"
+        let firstNumber = firstProvider.anonymousWorkspaceNumber(
+            forWorkspacePath: firstPath
+        )
+
+        XCTAssertNotEqual(
+            firstNumber,
+            secondProvider.anonymousWorkspaceNumber(forWorkspacePath: firstPath),
+            "The workspace number must depend on the injected HMAC key"
+        )
+        XCTAssertNotEqual(
+            firstNumber,
+            firstProvider.anonymousWorkspaceNumber(forWorkspacePath: secondPath),
+            "The workspace number must depend on the workspace path through HMAC"
+        )
+    }
+
+    func testHMACWorkspaceNumbersStayWithinAnonymousLabelRange() throws {
+        let provider = try HMACWorkspaceNumberProvider(
+            keyProvider: StubWorkspaceHMACKeyProvider(
+                key: Data(repeating: 0x5A, count: 32)
+            )
+        )
+
+        for index in 0..<100 {
+            let number = provider.anonymousWorkspaceNumber(
+                forWorkspacePath: "/Users/example/workspace-\(index)"
+            )
+            XCTAssertTrue((1...9_999).contains(number))
+        }
+    }
+
     private var privateSession: SessionDescriptor {
         SessionDescriptor(
             id: "019f6a08-478b-7ca0-b37e-ada2372f63f0",
@@ -83,5 +153,13 @@ private struct StubWorkspaceHMACProvider: WorkspaceHMACProviding {
 
     func anonymousWorkspaceNumber(forWorkspacePath _: String?) -> Int {
         number
+    }
+}
+
+private struct StubWorkspaceHMACKeyProvider: WorkspaceHMACKeyProviding {
+    let key: Data
+
+    func workspaceHMACKey() throws -> Data {
+        key
     }
 }
