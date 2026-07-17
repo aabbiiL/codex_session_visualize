@@ -34,6 +34,88 @@ final class PostureEngineTests: XCTestCase {
         XCTAssertEqual(posture.health, .longRunning)
     }
 
+    func testLaterModelActivitySupersedesHistoricalToolEvidence() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(kind: .toolStarted(processID: 42), at: base),
+                .fixture(kind: .processAlive(42), at: base.addingTimeInterval(300)),
+                .fixture(kind: .modelActivity, at: base.addingTimeInterval(301)),
+            ],
+            now: base.addingTimeInterval(301)
+        )
+
+        XCTAssertEqual(posture.phase, .modelProcessing)
+        XCTAssertEqual(posture.health, .normal)
+    }
+
+    func testLaterContextCompactionSupersedesHistoricalToolEvidence() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(kind: .toolStarted(processID: 42), at: base),
+                .fixture(kind: .processAlive(42), at: base.addingTimeInterval(300)),
+                .fixture(kind: .contextCompaction, at: base.addingTimeInterval(301)),
+            ],
+            now: base.addingTimeInterval(301)
+        )
+
+        XCTAssertEqual(posture.phase, .contextCompaction)
+        XCTAssertEqual(posture.health, .normal)
+    }
+
+    func testStaleProcessAliveDoesNotMakeToolLongRunning() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(kind: .toolStarted(processID: 42), at: base),
+                .fixture(kind: .processAlive(42), at: base.addingTimeInterval(300)),
+            ],
+            now: base.addingTimeInterval(301)
+        )
+
+        XCTAssertEqual(posture.phase, .toolExecuting)
+        XCTAssertEqual(posture.health, .normal)
+    }
+
+    func testInsufficientToolStartEvidenceOverridesHighCurrentLiveness() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(
+                    kind: .toolStarted(processID: 42),
+                    at: base,
+                    evidence: .fixture(grade: .unknown, sources: [])
+                ),
+                .fixture(kind: .processAlive(42), at: base.addingTimeInterval(300)),
+            ],
+            now: base.addingTimeInterval(300)
+        )
+
+        XCTAssertEqual(posture.phase, .unknown)
+        XCTAssertEqual(posture.health, .unknown)
+        XCTAssertEqual(posture.evidenceGrade, .unknown)
+    }
+
+    func testConflictingToolStartEvidenceOverridesHighCurrentLiveness() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(
+                    kind: .toolStarted(processID: 42),
+                    at: base,
+                    evidence: .fixture(grade: .unknown, sources: [.appServer, .rollout])
+                ),
+                .fixture(kind: .processAlive(42), at: base.addingTimeInterval(300)),
+            ],
+            now: base.addingTimeInterval(300)
+        )
+
+        XCTAssertEqual(posture.phase, .unknown)
+        XCTAssertEqual(posture.health, .unknown)
+        XCTAssertEqual(posture.evidenceGrade, .unknown)
+    }
+
     func testApprovalWaitIsActionRequiredAfterFifteenSeconds() {
         let event = ObservedEvent.fixture(kind: .waitingForApproval, at: base)
         XCTAssertEqual(engine.evaluate(session: .fixture(), events: [event], now: base.addingTimeInterval(14)).health, .normal)
