@@ -1,0 +1,6 @@
+2026-07-17T01:00:00.000Z INFO chatgpt_turn_started session_id=session-desktop-1 turn_id=turn-desktop-1 payload.message="FIXTURE_DESKTOP_PROMPT_SHOULD_BE_DROPPED"
+2026-07-17T01:00:01.000Z INFO chatgpt_response_routed session_id=session-desktop-1 turn_id=turn-desktop-1 item_id=response-1 payload.message="FIXTURE_DESKTOP_REPLY_SHOULD_BE_DROPPED"
+2026-07-17T01:00:02.000Z WARN chatgpt_pubsub_transport_closed session_id=session-desktop-1 turn_id=turn-desktop-1 error_code=PUBSUB_1006
+2026-07-17T01:00:03.000Z INFO chatgpt_pubsub_transport_opened session_id=session-desktop-1 turn_id=turn-desktop-1
+2026-07-17T01:00:04.000Z INFO chatgpt_item_completed session_id=session-desktop-1 turn_id=turn-desktop-1 item_id=response-1 duration_ms=875 command_output="FIXTURE_DESKTOP_COMMAND_OUTPUT_SHOULD_BE_DROPPED"
+2026-07-17T01:00:05.000Z ERROR renderer_unhandled_error code=RENDERER_ONLY_42 file_content="FIXTURE_DESKTOP_FILE_CONTENT_SHOULD_BE_DROPPED"

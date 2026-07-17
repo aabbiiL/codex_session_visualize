@@ -1,0 +1,10 @@
+{"timestamp":"2026-07-17T00:00:00.000Z","type":"session_meta","payload":{"id":"session-rollout-1","source":"cli","cwd":"/fixture/workspace","prompt":"FIXTURE_PROMPT_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:01.000Z","type":"turn_context","payload":{"session_id":"session-rollout-1","turn_id":"turn-rollout-1","payload.message":"FIXTURE_TURN_CONTEXT_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:02.000Z","type":"event_msg","payload":{"type":"task_started","session_id":"session-rollout-1","turn_id":"turn-rollout-1"}}
+{"timestamp":"2026-07-17T00:00:03.000Z","type":"event_msg","payload":{"type":"agent_reasoning","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"reasoning-1","message":"FIXTURE_REASONING_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:04.000Z","type":"response_item","payload":{"type":"function_call","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"tool-call-1","call_id":"call-1","name":"exec_command","process_id":4242,"arguments":"FIXTURE_FILE_CONTENT_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"tool-output-1","call_id":"call-1","duration_ms":1250,"output":"FIXTURE_TOOL_OUTPUT_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:06.000Z","type":"event_msg","payload":{"type":"plan_update","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"plan-1","plan":[{"step":"inspect","status":"completed"},{"step":"implement","status":"in_progress"},{"step":"verify","status":"pending"}],"message":"FIXTURE_PLAN_PROSE_SHOULD_BE_DROPPED"}}
+{"timestamp":"2026-07-17T00:00:07.000Z","type":"event_msg","payload":{"type":"task_complete","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"complete-1"}}
+{"timestamp":"2026-07-17T00:00:08.000Z","type":"event_msg","payload":{"type":"agent_reasoning","message":MALFORMED_FIXTURE}}
+{"timestamp":"2026-07-17T00:00:09.000Z","type":"event_msg","payload":{"type":"task_complete","message":"TRUNCATED_FIXTURE"
