@@ -7,10 +7,10 @@ on:
   pull_request:
 
 jobs:
-  build-info:
+  tests:
     runs-on: macos-14
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
-      - name: Run BuildInfo baseline
-        run: scripts/test --filter BuildInfoTests
+      - name: Run complete test suite
+        run: scripts/test
