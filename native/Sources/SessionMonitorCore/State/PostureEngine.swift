@@ -211,7 +211,25 @@ public struct PostureEngine: Sendable {
         now: Date
     ) -> SessionPosture {
         let duration = elapsed(since: activeTool.started.eventTime, now: now)
-        let isLongRunning = activeTool.liveness != nil && duration >= policy.toolLongRunningAfter
+        let currentLiveness = activeTool.liveness.flatMap { liveness in
+            liveness.observedAt == now ? liveness : nil
+        }
+        let evidence = combinedToolEvidence(
+            start: activeTool.started.evidence,
+            currentLiveness: currentLiveness?.evidence
+        )
+        if evidence.isConflicting || evidence.isInsufficient {
+            return unknownPosture(
+                session: session,
+                evidence: evidence,
+                lastActivityAt: latest.eventTime,
+                phaseStartedAt: activeTool.started.eventTime,
+                planCompletion: planCompletion,
+                now: now
+            )
+        }
+
+        let isLongRunning = currentLiveness != nil && duration >= policy.toolLongRunningAfter
 
         return posture(
             session: session,
@@ -219,7 +237,7 @@ public struct PostureEngine: Sendable {
             health: isLongRunning ? .longRunning : .normal,
             lastActivityAt: latest.eventTime,
             phaseStartedAt: activeTool.started.eventTime,
-            evidence: latest.evidence,
+            evidence: evidence,
             planCompletion: planCompletion,
             guidance: isLongRunning ? .toolLongRunning : nil,
             now: now
@@ -370,7 +388,15 @@ public struct PostureEngine: Sendable {
             }
             return (event, processID)
         }
-        guard let latestStart = starts.max(by: { $0.0.eventTime < $1.0.eventTime }) else {
+        guard let latestStart = starts.max(by: { eventOccursAfter($1.0, $0.0) }) else {
+            return nil
+        }
+
+        let wasSuperseded = events.contains { event in
+            eventSupersedesTool(event.kind)
+                && eventOccursAfter(event, latestStart.0)
+        }
+        if wasSuperseded {
             return nil
         }
 
@@ -379,9 +405,56 @@ public struct PostureEngine: Sendable {
                 return false
             }
             return processID == latestStart.1 && event.eventTime >= latestStart.0.eventTime
-        }.max { $0.eventTime < $1.eventTime }
+        }.max { eventOccursAfter($1, $0) }
 
         return ActiveTool(started: latestStart.0, liveness: liveness)
+    }
+
+    private func eventSupersedesTool(_ kind: ObservedEvent.Kind) -> Bool {
+        switch kind {
+        case .turnStarted,
+             .modelActivity,
+             .waitingForApproval,
+             .waitingForUser,
+             .contextCompaction,
+             .transportRetry,
+             .completed,
+             .failed,
+             .interrupted:
+            return true
+        case .toolStarted, .processAlive:
+            return false
+        }
+    }
+
+    private func eventOccursAfter(_ event: ObservedEvent, _ reference: ObservedEvent) -> Bool {
+        if event.eventTime != reference.eventTime {
+            return event.eventTime > reference.eventTime
+        }
+        return event.observedAt > reference.observedAt
+    }
+
+    private func combinedToolEvidence(
+        start: Evidence,
+        currentLiveness: Evidence?
+    ) -> Evidence {
+        let prerequisites = [start, currentLiveness].compactMap { $0 }
+        let grade: EvidenceGrade
+        if prerequisites.contains(where: { $0.grade == .unknown }) {
+            grade = .unknown
+        } else if prerequisites.contains(where: { $0.grade == .low }) {
+            grade = .low
+        } else if prerequisites.contains(where: { $0.grade == .medium }) {
+            grade = .medium
+        } else {
+            grade = .high
+        }
+
+        var seenSources: Set<EvidenceSource> = []
+        let sources = prerequisites.flatMap { $0.sources }.filter { source in
+            seenSources.insert(source).inserted
+        }
+        return Evidence(grade: grade, sources: sources)
     }
 
     private func elapsed(since date: Date, now: Date) -> TimeInterval {
