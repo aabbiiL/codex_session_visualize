@@ -1,21 +1,40 @@
 import Foundation
 
+public enum LocalSurface: String, Codable, Hashable, Sendable {
+    case desktop
+    case cli
+    case ide
+    case subAgent
+}
+
 public struct SessionDescriptor: Codable, Hashable, Sendable {
     public let id: String
     public let title: String?
     public let workspacePath: String?
     public let lastActivityAt: Date
+    public let surface: LocalSurface?
+    public let rolloutPath: String?
+    public let agentNickname: String?
+    public let agentRole: String?
 
     public init(
         id: String,
         title: String?,
         workspacePath: String?,
-        lastActivityAt: Date
+        lastActivityAt: Date,
+        surface: LocalSurface? = nil,
+        rolloutPath: String? = nil,
+        agentNickname: String? = nil,
+        agentRole: String? = nil
     ) {
         self.id = id
         self.title = title
         self.workspacePath = workspacePath
         self.lastActivityAt = lastActivityAt
+        self.surface = surface
+        self.rolloutPath = rolloutPath
+        self.agentNickname = agentNickname
+        self.agentRole = agentRole
     }
 }
 
