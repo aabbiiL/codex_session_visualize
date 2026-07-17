@@ -75,7 +75,10 @@ public struct EvidenceNormalizer: Sendable {
         let triggeringEvent = latestEvent(in: events)
         let sources = triggeringEvent?.evidence.sources ?? []
         let conflictingSources = triggeringEvent.flatMap { event in
-            conflictsByIdentity[EventIdentityKey(event)]
+            guard event.kind.isTerminal else {
+                return nil
+            }
+            return conflictsByIdentity[EventIdentityKey(event)]
         } ?? []
         let grade = triggeringEvent?.evidence.grade ?? .unknown
 
@@ -210,24 +213,37 @@ public struct EvidenceNormalizer: Sendable {
             return left.sessionID < right.sessionID
         }
         if left.turnID != right.turnID {
-            return (left.turnID ?? "") < (right.turnID ?? "")
+            return optionalIdentifierPrecedes(left.turnID, right.turnID)
         }
         if left.itemID != right.itemID {
-            return (left.itemID ?? "") < (right.itemID ?? "")
+            return optionalIdentifierPrecedes(left.itemID, right.itemID)
         }
         return semanticKindRank(left.kind) < semanticKindRank(right.kind)
     }
 
     private func latestEvent(in events: [ObservedEvent]) -> ObservedEvent? {
-        events.enumerated().max { left, right in
-            if left.element.eventTime != right.element.eventTime {
-                return left.element.eventTime < right.element.eventTime
+        events.max { left, right in
+            if left.eventTime != right.eventTime {
+                return left.eventTime < right.eventTime
             }
-            if left.element.observedAt != right.element.observedAt {
-                return left.element.observedAt < right.element.observedAt
+            if left.observedAt != right.observedAt {
+                return left.observedAt < right.observedAt
             }
-            return left.offset < right.offset
-        }?.element
+            return eventPrecedes(left, right)
+        }
+    }
+
+    private func optionalIdentifierPrecedes(_ left: String?, _ right: String?) -> Bool {
+        switch (left, right) {
+        case (nil, nil):
+            return false
+        case (nil, .some(_)):
+            return true
+        case (.some(_), nil):
+            return false
+        case let (.some(leftValue), .some(rightValue)):
+            return leftValue < rightValue
+        }
     }
 
     private func semanticKindRank(_ kind: ObservedEvent.Kind) -> String {
