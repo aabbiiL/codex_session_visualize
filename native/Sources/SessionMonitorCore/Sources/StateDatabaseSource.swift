@@ -60,13 +60,18 @@ public struct StateDatabaseSource: EventSource {
                 from: database,
                 childSessionIDs: childSessionIDs
             )
+            let sessionIDs = Set(sessions.map(\.id))
+            let activeLocalRelationships = relationships.filter {
+                sessionIDs.contains($0.parentSessionID)
+                    && sessionIDs.contains($0.childSessionID)
+            }
             let maximumRecency = sessions
                 .map { Int64($0.lastActivityAt.timeIntervalSince1970 * 1_000) }
                 .max() ?? 0
 
             return SourcePollResult(
                 sessions: sessions,
-                spawnRelationships: relationships,
+                spawnRelationships: activeLocalRelationships,
                 health: SourceHealth(status: .healthy),
                 cursor: SourceCursor(
                     source: id,
