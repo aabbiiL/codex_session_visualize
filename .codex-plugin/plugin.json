@@ -1,0 +1,19 @@
+{
+  "name": "codex-session-monitor",
+  "version": "0.1.0",
+  "description": "Codex Session Monitor plugin",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Session Monitor",
+    "shortDescription": "Use Codex Session Monitor in Codex.",
+    "longDescription": "Codex Session Monitor adds a local Codex plugin scaffold.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Codex Session Monitor."
+  },
+  "mcpServers": "./.mcp.json"
+}

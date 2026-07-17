@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - feature/v1
+  pull_request:
+
+jobs:
+  build-info:
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Run BuildInfo baseline
+        run: scripts/test --filter BuildInfoTests

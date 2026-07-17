@@ -1,0 +1,8 @@
+#!/bin/zsh
+set -euo pipefail
+ROOT="${0:A:h:h}"
+CACHE="$ROOT/native/.build/module-cache"
+mkdir -p "$CACHE"
+export SWIFT_MODULE_CACHE_PATH="$CACHE"
+export CLANG_MODULE_CACHE_PATH="$CACHE"
+exec /usr/bin/swift test --package-path "$ROOT/native" "$@"
