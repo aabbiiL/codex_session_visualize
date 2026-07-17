@@ -49,6 +49,19 @@ final class PostureEngineTests: XCTestCase {
         XCTAssertEqual(posture.health, .normal)
     }
 
+    func testEqualTimestampLaterModelActivitySupersedesEarlierToolStart() {
+        let posture = engine.evaluate(
+            session: .fixture(),
+            events: [
+                .fixture(kind: .toolStarted(processID: 42), at: base),
+                .fixture(kind: .modelActivity, at: base),
+            ],
+            now: base
+        )
+
+        XCTAssertEqual(posture.phase, .modelProcessing)
+    }
+
     func testLaterContextCompactionSupersedesHistoricalToolEvidence() {
         let posture = engine.evaluate(
             session: .fixture(),
