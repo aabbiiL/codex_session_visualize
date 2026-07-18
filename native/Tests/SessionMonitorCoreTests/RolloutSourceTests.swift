@@ -95,7 +95,8 @@ final class RolloutSourceTests: XCTestCase {
         defer { fixture.remove() }
 
         let result = await RolloutSource(session: fixture.session).poll(since: nil)
-        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+        let encodedData = try JSONEncoder().encode(result)
+        let encoded = String(decoding: encodedData, as: UTF8.self)
         let forbidden = [
             "FIXTURE_PROMPT_SHOULD_BE_DROPPED",
             "FIXTURE_TURN_CONTEXT_SHOULD_BE_DROPPED",
@@ -105,13 +106,17 @@ final class RolloutSourceTests: XCTestCase {
             "FIXTURE_PLAN_PROSE_SHOULD_BE_DROPPED",
             "payload.message",
             "arguments",
-            "output",
             "prompt",
         ]
 
         for value in forbidden {
             XCTAssertFalse(encoded.contains(value), "Retained forbidden rollout value: \(value)")
         }
+        let jsonObject = try JSONSerialization.jsonObject(with: encodedData)
+        XCTAssertFalse(
+            containsJSONKey("output", in: jsonObject),
+            "Retained forbidden rollout field: output"
+        )
     }
 
     func testRestoredFileCursorDoesNotRescanCompletedUnchangedRollout() async throws {
@@ -190,4 +195,16 @@ private func fixtureResourceURL(named name: String, extension fileExtension: Str
             subdirectory: "Fixtures"
         ) ?? Bundle.module.url(forResource: name, withExtension: fileExtension)
     )
+}
+
+private func containsJSONKey(_ key: String, in value: Any) -> Bool {
+    if let object = value as? [String: Any] {
+        return object.keys.contains(key) || object.values.contains {
+            containsJSONKey(key, in: $0)
+        }
+    }
+    if let array = value as? [Any] {
+        return array.contains { containsJSONKey(key, in: $0) }
+    }
+    return false
 }
