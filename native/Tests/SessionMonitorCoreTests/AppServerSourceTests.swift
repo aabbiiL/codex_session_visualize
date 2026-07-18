@@ -294,8 +294,9 @@ private final class BoundUnixSocketFixture {
     private let descriptor: Int32
 
     init() throws {
-        directoryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AppServerDiscoveryTests-\(UUID().uuidString)")
+        let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)
+        directoryURL = URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent("csm-as-\(suffix)", isDirectory: true)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         socketURL = directoryURL.appendingPathComponent("app-server.sock")
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
