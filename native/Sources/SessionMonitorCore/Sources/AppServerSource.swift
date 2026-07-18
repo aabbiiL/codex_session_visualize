@@ -34,6 +34,7 @@ public enum AppServerTransportFailure: Error, Hashable, Sendable {
     case malformedFrame
     case protocolViolation
     case messageTooLarge
+    case serverError(code: Int)
 }
 
 public actor UnixWebSocketAppServerTransport: AppServerTransport {
@@ -78,15 +79,31 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
                     throw AppServerTransportFailure.connectionClosed
                 }
                 let envelope = try wireEnvelope(message)
-                if envelope.method != nil, envelope.id == nil {
-                    try enqueueNotification(message)
+                if envelope.method != nil {
+                    if envelope.id == nil {
+                        try enqueueNotification(message)
+                    }
+                    // App Server can initiate requests while a client request is pending.
+                    // This observer never needs their content, so discard them without
+                    // mistaking a colliding server request ID for our response.
                     continue
                 }
                 guard envelope.id == requestID else {
                     throw AppServerTransportFailure.protocolViolation
                 }
-                return message
+                switch try responseKind(in: message) {
+                case .result:
+                    return message
+                case let .error(code):
+                    throw AppServerTransportFailure.serverError(code: code)
+                }
             }
+        } catch let error as AppServerTransportFailure {
+            if case .serverError = error {
+                throw error
+            }
+            await resetConnection()
+            throw error
         } catch {
             await resetConnection()
             throw error
@@ -110,13 +127,19 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
             queuedNotifications.removeAll(keepingCapacity: true)
             queuedNotificationBytes = 0
             var totalBytes = messages.reduce(0) { $0 + $1.count }
-            while messages.count < Self.maximumDrainedNotifications {
+            var drainedEnvelopeCount = messages.count
+            while drainedEnvelopeCount < Self.maximumDrainedNotifications {
                 guard let message = try await nextServerTextMessage(waitForData: false) else {
                     break
                 }
+                drainedEnvelopeCount += 1
                 let envelope = try wireEnvelope(message)
-                guard envelope.method != nil, envelope.id == nil else {
+                guard envelope.method != nil else {
                     throw AppServerTransportFailure.protocolViolation
+                }
+                if envelope.id != nil {
+                    // Server-initiated requests are deliberately content-free here.
+                    continue
                 }
                 totalBytes += message.count
                 guard totalBytes <= Self.maximumMessageBytes else {
@@ -365,21 +388,50 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AppServerTransportFailure.protocolViolation
         }
-        let method = object["method"] as? String
-        let id: Int?
-        if let rawID = object["id"] {
-            guard let number = rawID as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID(),
-                  !Self.isFloatingPointNumber(number),
-                  number.int64Value >= Int64(Int.min),
-                  number.int64Value <= Int64(Int.max) else {
+        let method: String?
+        if let rawMethod = object["method"] {
+            guard let string = rawMethod as? String else {
                 throw AppServerTransportFailure.protocolViolation
             }
-            id = Int(number.int64Value)
+            method = string
+        } else {
+            method = nil
+        }
+        let id: Int?
+        if let rawID = object["id"] {
+            id = try exactInteger(rawID)
         } else {
             id = nil
         }
         return WireEnvelope(method: method, id: id)
+    }
+
+    private func responseKind(in data: Data) throws -> WireResponseKind {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        let hasResult = object.keys.contains("result")
+        let hasError = object.keys.contains("error")
+        guard hasResult != hasError else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        if hasResult { return .result }
+        guard let error = object["error"] as? [String: Any],
+              let rawCode = error["code"] else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        return .error(code: try exactInteger(rawCode))
+    }
+
+    private func exactInteger(_ rawValue: Any) throws -> Int {
+        guard let number = rawValue as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !Self.isFloatingPointNumber(number),
+              number.int64Value >= Int64(Int.min),
+              number.int64Value <= Int64(Int.max) else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        return Int(number.int64Value)
     }
 
     private static func isFloatingPointNumber(_ number: NSNumber) -> Bool {
@@ -430,6 +482,11 @@ private struct WebSocketFrame {
 private struct WireEnvelope {
     let method: String?
     let id: Int?
+}
+
+private enum WireResponseKind {
+    case result
+    case error(code: Int)
 }
 
 public protocol DarwinUnixSocketSyscalls: Sendable {
@@ -649,6 +706,8 @@ public actor AppServerSource: EventSource {
     private let diagnosticConnectionProbe: ConnectionProbe?
     private let reconnectBackoff: AppServerReconnectBackoff
     private let reconnectSleeper: @Sendable (Int) async -> Void
+    private let maximumPaginationPages: Int
+    private let maximumPaginationItems: Int
     private let now: @Sendable () -> Date
     private var initialized = false
     private var nextRequestID = 1
@@ -673,6 +732,8 @@ public actor AppServerSource: EventSource {
             guard milliseconds > 0 else { return }
             try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
         },
+        maximumPaginationPages: Int = 100,
+        maximumPaginationItems: Int = 10_000,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.endpoint = endpoint
@@ -680,6 +741,8 @@ public actor AppServerSource: EventSource {
         self.diagnosticConnectionProbe = diagnosticConnectionProbe
         self.reconnectBackoff = reconnectBackoff
         self.reconnectSleeper = reconnectSleeper
+        self.maximumPaginationPages = max(1, maximumPaginationPages)
+        self.maximumPaginationItems = max(1, maximumPaginationItems)
         self.now = now
     }
 
@@ -700,7 +763,10 @@ public actor AppServerSource: EventSource {
             for threadID in loadedThreadIDs where !subscribedThreadIDs.contains(threadID) {
                 _ = try await request(
                     method: "thread/resume",
-                    params: ["threadId": threadID],
+                    params: [
+                        "threadId": threadID,
+                        "excludeTurns": true,
+                    ],
                     endpoint: endpoint
                 )
                 subscribedThreadIDs.insert(threadID)
@@ -708,7 +774,8 @@ public actor AppServerSource: EventSource {
 
             let threads = try await listedThreads(endpoint: endpoint)
             let observedAt = now()
-            let currentSnapshot = snapshotKinds(threads)
+            let snapshot = snapshotKinds(threads)
+            let currentSnapshot = snapshot.kinds
             var events = currentSnapshot.compactMap { sessionID, kind -> RawSourceEvent? in
                 guard structuralSnapshot[sessionID] != kind else { return nil }
                 return rawEvent(
@@ -720,14 +787,18 @@ public actor AppServerSource: EventSource {
                 )
             }.sorted { $0.sessionID < $1.sessionID }
             structuralSnapshot = currentSnapshot
-            var malformed = false
+            var malformed = !snapshot.conflictedSessionIDs.isEmpty
             for data in try await transport.drainNotifications(at: endpoint) {
                 do {
                     if let event = try eventFromNotification(data, observedAt: observedAt) {
-                        events.append(event)
                         if event.turnID == nil, event.itemID == nil {
+                            guard !snapshot.conflictedSessionIDs.contains(event.sessionID),
+                                  structuralSnapshot[event.sessionID] != event.kind else {
+                                continue
+                            }
                             structuralSnapshot[event.sessionID] = event.kind
                         }
+                        events.append(event)
                     }
                 } catch {
                     malformed = true
@@ -765,6 +836,9 @@ public actor AppServerSource: EventSource {
                     "name": "codex-session-monitor",
                     "version": "1.0",
                 ],
+                "capabilities": [
+                    "experimentalApi": true,
+                ],
             ],
             endpoint: endpoint
         )
@@ -783,7 +857,13 @@ public actor AppServerSource: EventSource {
     private func loadedThreads(endpoint: AppServerEndpoint) async throws -> [String] {
         var cursor: String?
         var result: [String] = []
+        var pageCount = 0
+        var seenCursors = Set<String>()
         repeat {
+            guard pageCount < maximumPaginationPages else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            pageCount += 1
             var params: [String: Any] = ["limit": 100]
             if let cursor { params["cursor"] = cursor }
             let page = try await request(
@@ -791,8 +871,12 @@ public actor AppServerSource: EventSource {
                 params: params,
                 endpoint: endpoint
             )
-            if let ids = page["data"] as? [String] { result.append(contentsOf: ids) }
-            cursor = page["nextCursor"] as? String
+            guard let ids = page["data"] as? [String],
+                  ids.count <= maximumPaginationItems - result.count else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            result.append(contentsOf: ids)
+            cursor = try nextCursor(in: page, seenCursors: &seenCursors)
         } while cursor != nil
         return result
     }
@@ -800,7 +884,13 @@ public actor AppServerSource: EventSource {
     private func listedThreads(endpoint: AppServerEndpoint) async throws -> [[String: Any]] {
         var cursor: String?
         var result: [[String: Any]] = []
+        var pageCount = 0
+        var seenCursors = Set<String>()
         repeat {
+            guard pageCount < maximumPaginationPages else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            pageCount += 1
             var params: [String: Any] = [
                 "limit": 100,
                 "sourceKinds": Self.allSourceKinds,
@@ -811,12 +901,29 @@ public actor AppServerSource: EventSource {
                 params: params,
                 endpoint: endpoint
             )
-            if let threads = page["data"] as? [[String: Any]] {
-                result.append(contentsOf: threads)
+            guard let threads = page["data"] as? [[String: Any]],
+                  threads.count <= maximumPaginationItems - result.count else {
+                throw AppServerSourceFailure.malformedMessage
             }
-            cursor = page["nextCursor"] as? String
+            result.append(contentsOf: threads)
+            cursor = try nextCursor(in: page, seenCursors: &seenCursors)
         } while cursor != nil
         return result
+    }
+
+    private func nextCursor(
+        in page: [String: Any],
+        seenCursors: inout Set<String>
+    ) throws -> String? {
+        guard let rawCursor = page["nextCursor"] else {
+            throw AppServerSourceFailure.malformedMessage
+        }
+        if rawCursor is NSNull { return nil }
+        guard let cursor = rawCursor as? String,
+              seenCursors.insert(cursor).inserted else {
+            throw AppServerSourceFailure.malformedMessage
+        }
+        return cursor
     }
 
     private func request(
@@ -873,10 +980,26 @@ public actor AppServerSource: EventSource {
         guard responseID == expectedID else {
             throw AppServerSourceFailure.responseIDMismatch
         }
-        guard let result = object["result"] as? [String: Any] else {
+        let hasResult = object.keys.contains("result")
+        let hasError = object.keys.contains("error")
+        guard hasResult != hasError else {
             throw AppServerSourceFailure.malformedMessage
         }
-        return result
+        if hasResult {
+            guard let result = object["result"] as? [String: Any] else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            return result
+        }
+        guard let error = object["error"] as? [String: Any],
+              let code = error["code"] as? NSNumber,
+              CFGetTypeID(code) != CFBooleanGetTypeID(),
+              !Self.isFloatingPointNumber(code),
+              code.int64Value >= Int64(Int.min),
+              code.int64Value <= Int64(Int.max) else {
+            throw AppServerSourceFailure.malformedMessage
+        }
+        throw AppServerTransportFailure.serverError(code: Int(code.int64Value))
     }
 
     private static func isFloatingPointNumber(_ number: NSNumber) -> Bool {
@@ -884,17 +1007,24 @@ public actor AppServerSource: EventSource {
         return type == "f" || type == "d"
     }
 
-    private func snapshotKinds(
-        _ threads: [[String: Any]]
-    ) -> [String: ObservedEvent.Kind] {
-        Dictionary(uniqueKeysWithValues: threads.compactMap { thread in
+    private func snapshotKinds(_ threads: [[String: Any]]) -> SnapshotFold {
+        var kinds: [String: ObservedEvent.Kind] = [:]
+        var conflictedSessionIDs = Set<String>()
+        for thread in threads {
             guard let sessionID = thread["id"] as? String,
                   let status = thread["status"] as? [String: Any],
                   let kind = kindFromThreadStatus(status) else {
-                return nil
+                continue
             }
-            return (sessionID, kind)
-        })
+            guard !conflictedSessionIDs.contains(sessionID) else { continue }
+            if let existing = kinds[sessionID], existing != kind {
+                kinds.removeValue(forKey: sessionID)
+                conflictedSessionIDs.insert(sessionID)
+            } else {
+                kinds[sessionID] = kind
+            }
+        }
+        return SnapshotFold(kinds: kinds, conflictedSessionIDs: conflictedSessionIDs)
     }
 
     private func eventFromNotification(
@@ -1043,6 +1173,11 @@ public actor AppServerSource: EventSource {
             durationMilliseconds: durationMilliseconds
         )
     }
+}
+
+private struct SnapshotFold {
+    let kinds: [String: ObservedEvent.Kind]
+    let conflictedSessionIDs: Set<String>
 }
 
 private enum AppServerSourceFailure: Error {
