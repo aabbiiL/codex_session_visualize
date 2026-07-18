@@ -267,6 +267,135 @@ final class AppServerReviewRegressionTests: XCTestCase {
         XCTAssertTrue(second.events.isEmpty, "Repeated identical notifications must not refresh activity")
     }
 
+    func testFailedNotificationDrainDoesNotCommitStructuralSnapshot() async {
+        let active = listedThreadResult(id: "atomic-active", status: "active")
+        let transport = ReviewFakeAppServerTransport(
+            steps: [
+                .response("initialize", result: supportedInitializeResult),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: pagedResult(rows: [active], nextCursor: nil)),
+                .response("initialize", result: supportedInitializeResult),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: pagedResult(rows: [active], nextCursor: nil)),
+            ],
+            drainSteps: [
+                .failure(AppServerTransportFailure.connectionClosed),
+                .notifications([]),
+            ]
+        )
+        let source = AppServerSource(
+            endpoint: endpoint,
+            transport: transport,
+            reconnectSleeper: { _ in },
+            now: { self.fixedNow }
+        )
+
+        let failed = await source.poll(since: nil)
+        let recovered = await source.poll(since: nil)
+
+        XCTAssertEqual(failed.health.status, .unavailable)
+        XCTAssertTrue(failed.events.isEmpty)
+        XCTAssertEqual(recovered.health, SourceHealth(status: .healthy))
+        XCTAssertEqual(recovered.events.count, 1)
+        XCTAssertEqual(recovered.events.map(\.sessionID), ["atomic-active"])
+        XCTAssertEqual(recovered.events.map(\.kind), [.modelActivity])
+    }
+
+    func testCommandCompletionPreservesWireOrderThroughNormalizationAndPosture() async {
+        let sessionID = "causal-command"
+        let notifications = [
+            commandItemNotification(
+                method: "item/started",
+                sessionID: sessionID,
+                turnID: "turn-command",
+                itemID: "item-command",
+                processID: 73
+            ),
+            commandItemNotification(
+                method: "item/completed",
+                sessionID: sessionID,
+                turnID: "turn-command",
+                itemID: "item-command",
+                processID: 73
+            ),
+        ]
+        let transport = ReviewFakeAppServerTransport(
+            steps: [
+                .response("initialize", result: supportedInitializeResult),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: #"{"data":[],"nextCursor":null}"#),
+            ],
+            notificationBatches: [notifications]
+        )
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let result = await source.poll(since: nil)
+
+        XCTAssertEqual(result.health, SourceHealth(status: .healthy))
+        XCTAssertEqual(result.events.map(\.kind), [.toolStarted(processID: 73), .modelActivity])
+        guard result.events.count == 2 else {
+            XCTFail("Expected exactly the two command lifecycle events")
+            return
+        }
+        XCTAssertLessThan(result.events[0].eventTime, result.events[1].eventTime)
+        XCTAssertLessThan(result.events[0].observedAt, result.events[1].observedAt)
+
+        let normalized = EvidenceNormalizer().normalize(result.events).events
+        XCTAssertEqual(normalized.map(\.kind), [.toolStarted(processID: 73), .modelActivity])
+        let posture = PostureEngine(policy: .defaults).evaluate(
+            session: SessionDescriptor(
+                id: sessionID,
+                title: nil,
+                workspacePath: nil,
+                lastActivityAt: self.fixedNow
+            ),
+            events: normalized,
+            now: normalized.last?.eventTime ?? self.fixedNow
+        )
+        XCTAssertEqual(posture.phase, .modelProcessing)
+        XCTAssertNotEqual(posture.phase, .toolExecuting)
+    }
+
+    func testStructuralTransitionPreservesInventoryBeforeNotificationThroughNormalizationAndPosture() async {
+        let sessionID = "causal-structural"
+        let idle = listedThreadResult(id: sessionID, status: "idle")
+        let transport = ReviewFakeAppServerTransport(
+            steps: [
+                .response("initialize", result: supportedInitializeResult),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: pagedResult(rows: [idle], nextCursor: nil)),
+            ],
+            notificationBatches: [[threadStatusChanged(id: sessionID, status: "active")]]
+        )
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let result = await source.poll(since: nil)
+
+        XCTAssertEqual(result.health, SourceHealth(status: .healthy))
+        XCTAssertEqual(result.events.map(\.kind), [.completed, .modelActivity])
+        guard result.events.count == 2 else {
+            XCTFail("Expected inventory and notification transitions")
+            return
+        }
+        XCTAssertLessThan(result.events[0].eventTime, result.events[1].eventTime)
+        XCTAssertLessThan(result.events[0].observedAt, result.events[1].observedAt)
+
+        let normalized = EvidenceNormalizer().normalize(result.events).events
+        XCTAssertEqual(normalized.map(\.kind), [.completed, .modelActivity])
+        let posture = PostureEngine(policy: .defaults).evaluate(
+            session: SessionDescriptor(
+                id: sessionID,
+                title: nil,
+                workspacePath: nil,
+                lastActivityAt: self.fixedNow
+            ),
+            events: normalized,
+            now: normalized.last?.eventTime ?? self.fixedNow
+        )
+        XCTAssertEqual(posture.phase, .modelProcessing)
+        XCTAssertNotEqual(posture.phase, .completed)
+    }
+
     func testRepeatedPaginationCursorTerminatesWithinConfiguredBound() async {
         let transport = ReviewFakeAppServerTransport(steps: [
             .response("initialize", result: supportedInitializeResult),
@@ -605,15 +734,25 @@ private enum ReviewStep: @unchecked Sendable {
     case failure(String, Error)
 }
 
+private enum ReviewDrainStep: @unchecked Sendable {
+    case notifications([Data])
+    case failure(Error)
+}
+
 private actor ReviewFakeAppServerTransport: AppServerTransport {
     private var steps: [ReviewStep]
-    private var notificationBatches: [[Data]]
+    private var drainSteps: [ReviewDrainStep]
     private var requests: [ReviewRequest] = []
     private var notifications: [Data] = []
 
     init(steps: [ReviewStep], notificationBatches: [[Data]] = []) {
         self.steps = steps
-        self.notificationBatches = notificationBatches
+        self.drainSteps = notificationBatches.map(ReviewDrainStep.notifications)
+    }
+
+    init(steps: [ReviewStep], drainSteps: [ReviewDrainStep]) {
+        self.steps = steps
+        self.drainSteps = drainSteps
     }
 
     func request(_ payload: Data, at endpoint: AppServerEndpoint) async throws -> Data {
@@ -642,8 +781,13 @@ private actor ReviewFakeAppServerTransport: AppServerTransport {
     }
 
     func drainNotifications(at endpoint: AppServerEndpoint) async throws -> [Data] {
-        guard !notificationBatches.isEmpty else { return [] }
-        return notificationBatches.removeFirst()
+        guard !drainSteps.isEmpty else { return [] }
+        switch drainSteps.removeFirst() {
+        case let .notifications(batch):
+            return batch
+        case let .failure(error):
+            throw error
+        }
     }
 
     func recordedRequests() -> [ReviewRequest] { requests }
@@ -706,5 +850,18 @@ private func itemStarted(
     let json = "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thread-items\","
         + "\"turnId\":\"turn-items\",\"item\":{\"id\":\"\(id)\",\"type\":\"\(type)\""
         + process + ",\"\(bodyKey)\":\"FIXTURE_REVIEW_BODY_MUST_BE_DROPPED\"}}}"
+    return Data(json.utf8)
+}
+
+private func commandItemNotification(
+    method: String,
+    sessionID: String,
+    turnID: String,
+    itemID: String,
+    processID: Int
+) -> Data {
+    let json = "{\"method\":\"\(method)\",\"params\":{\"threadId\":\"\(sessionID)\","
+        + "\"turnId\":\"\(turnID)\",\"item\":{\"id\":\"\(itemID)\","
+        + "\"type\":\"commandExecution\",\"processId\":\(processID)}}}"
     return Data(json.utf8)
 }
