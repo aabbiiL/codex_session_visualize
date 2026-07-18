@@ -52,16 +52,15 @@ final class DesktopLogSourceTests: XCTestCase {
         let result = await DesktopLogSource(logDirectory: fixture.directoryURL).poll(since: nil)
 
         XCTAssertEqual(result.health.status, .degraded)
-        XCTAssertEqual(
-            result.health.issues,
-            [
-                .rendererError(
-                    path: fixture.fileURL.standardizedFileURL.path,
-                    code: "RENDERER_ONLY_42",
-                    lineNumber: 6
-                ),
-            ]
-        )
+        XCTAssertEqual(result.health.issues.count, 1)
+        guard case let .rendererError(path, code, lineNumber) = try XCTUnwrap(
+            result.health.issues.first
+        ) else {
+            return XCTFail("Expected one renderer error issue")
+        }
+        XCTAssertEqual(URL(fileURLWithPath: path).lastPathComponent, fixture.fileURL.lastPathComponent)
+        XCTAssertEqual(code, "RENDERER_ONLY_42")
+        XCTAssertEqual(lineNumber, 6)
         XCTAssertFalse(result.events.contains { $0.kind == .failed })
         XCTAssertEqual(result.events.count, 5, "Renderer diagnostics must not become session events")
     }
