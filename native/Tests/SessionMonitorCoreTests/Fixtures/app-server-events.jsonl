@@ -1,0 +1,12 @@
+{"id":1,"result":{"protocolVersion":"2026-07-01"}}
+{"id":2,"result":{"data":[{"id":"thread-from-list","status":{"type":"active","activeFlags":[]}}],"nextCursor":null}}
+{"method":"thread/status/changed","params":{"threadId":"thread-approval","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}
+{"method":"thread/status/changed","params":{"threadId":"thread-user","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}
+{"method":"turn/started","params":{"threadId":"thread-turns","turn":{"id":"turn-running","status":"inProgress","items":[]}}}
+{"method":"item/started","params":{"threadId":"thread-turns","turnId":"turn-running","item":{"id":"command-1","type":"commandExecution","status":"inProgress","processId":4242,"command":"FIXTURE_APP_SERVER_COMMAND_BODY_SHOULD_BE_DROPPED"}}}
+{"method":"item/completed","params":{"threadId":"thread-turns","turnId":"turn-running","item":{"id":"command-1","type":"commandExecution","status":"completed","processId":4242,"durationMs":1250,"output":"FIXTURE_APP_SERVER_COMMAND_OUTPUT_SHOULD_BE_DROPPED"}}}
+{"method":"turn/completed","params":{"threadId":"thread-turns","turn":{"id":"turn-completed","status":"completed","items":[],"output":"FIXTURE_APP_SERVER_TURN_OUTPUT_SHOULD_BE_DROPPED"}}}
+{"method":"turn/completed","params":{"threadId":"thread-turns","turn":{"id":"turn-interrupted","status":"interrupted","items":[]}}}
+{"method":"turn/completed","params":{"threadId":"thread-turns","turn":{"id":"turn-failed","status":"failed","items":[],"error":{"message":"FIXTURE_APP_SERVER_ERROR_BODY_SHOULD_BE_DROPPED"}}}}
+{"method":"item/started","params":{"threadId":"thread-turns","turnId":"turn-running","item":{"id":"tool-1","type":"mcpToolCall","status":"inProgress","processId":5252,"arguments":{"secret":"FIXTURE_APP_SERVER_TOOL_ARGUMENTS_SHOULD_BE_DROPPED"}}}}
+{"method":"item/completed","params":{"threadId":"thread-turns","turnId":"turn-running","item":{"id":"tool-1","type":"mcpToolCall","status":"completed","processId":5252,"durationMs":250,"output":{"secret":"FIXTURE_APP_SERVER_TOOL_OUTPUT_SHOULD_BE_DROPPED"}}}}
