@@ -40,6 +40,7 @@ public enum AppServerTransportFailure: Error, Hashable, Sendable {
 public actor UnixWebSocketAppServerTransport: AppServerTransport {
     public static let maximumMessageBytes = 4_194_304
     public static let maximumDrainedNotifications = 64
+    public static let maximumInterleavedServerRequests = 64
 
     private let streamFactory: any UnixSocketByteStreamFactory
     private let webSocketKeyGenerator: @Sendable () -> String
@@ -74,6 +75,8 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
             let requestID = try exactIntegerID(in: payload)
             try await ensureConnected(to: endpoint)
             try await sendText(payload)
+            var discardedServerRequestCount = 0
+            var discardedServerRequestBytes = 0
             while true {
                 guard let message = try await nextServerTextMessage(waitForData: true) else {
                     throw AppServerTransportFailure.connectionClosed
@@ -82,13 +85,22 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
                 if envelope.method != nil {
                     if envelope.id == nil {
                         try enqueueNotification(message)
+                    } else {
+                        discardedServerRequestCount += 1
+                        guard discardedServerRequestCount <= Self.maximumInterleavedServerRequests else {
+                            throw AppServerTransportFailure.protocolViolation
+                        }
+                        guard message.count <= Self.maximumMessageBytes - discardedServerRequestBytes else {
+                            throw AppServerTransportFailure.messageTooLarge
+                        }
+                        discardedServerRequestBytes += message.count
                     }
                     // App Server can initiate requests while a client request is pending.
                     // This observer never needs their content, so discard them without
                     // mistaking a colliding server request ID for our response.
                     continue
                 }
-                guard envelope.id == requestID else {
+                guard envelope.id == .integer(requestID) else {
                     throw AppServerTransportFailure.protocolViolation
                 }
                 switch try responseKind(in: message) {
@@ -128,6 +140,7 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
             queuedNotificationBytes = 0
             var totalBytes = messages.reduce(0) { $0 + $1.count }
             var drainedEnvelopeCount = messages.count
+            var discardedServerRequestBytes = 0
             while drainedEnvelopeCount < Self.maximumDrainedNotifications {
                 guard let message = try await nextServerTextMessage(waitForData: false) else {
                     break
@@ -139,6 +152,10 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
                 }
                 if envelope.id != nil {
                     // Server-initiated requests are deliberately content-free here.
+                    guard message.count <= Self.maximumMessageBytes - discardedServerRequestBytes else {
+                        throw AppServerTransportFailure.messageTooLarge
+                    }
+                    discardedServerRequestBytes += message.count
                     continue
                 }
                 totalBytes += message.count
@@ -378,7 +395,7 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
 
     private func exactIntegerID(in data: Data) throws -> Int {
         let envelope = try wireEnvelope(data)
-        guard let id = envelope.id else {
+        guard case let .integer(id)? = envelope.id else {
             throw AppServerTransportFailure.protocolViolation
         }
         return id
@@ -397,9 +414,13 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
         } else {
             method = nil
         }
-        let id: Int?
+        let id: WireRequestID?
         if let rawID = object["id"] {
-            id = try exactInteger(rawID)
+            if let string = rawID as? String {
+                id = .string(string)
+            } else {
+                id = .integer(try exactInteger(rawID))
+            }
         } else {
             id = nil
         }
@@ -481,7 +502,12 @@ private struct WebSocketFrame {
 
 private struct WireEnvelope {
     let method: String?
-    let id: Int?
+    let id: WireRequestID?
+}
+
+private enum WireRequestID: Equatable {
+    case integer(Int)
+    case string(String)
 }
 
 private enum WireResponseKind {
@@ -712,7 +738,7 @@ public actor AppServerSource: EventSource {
     private var initialized = false
     private var nextRequestID = 1
     private var subscribedThreadIDs = Set<String>()
-    private var structuralSnapshot: [String: ObservedEvent.Kind] = [:]
+    private var structuralSnapshot: [String: ThreadStatusFact] = [:]
     private var consecutiveFailures = 0
 
     private static let allSourceKinds = [
@@ -774,10 +800,13 @@ public actor AppServerSource: EventSource {
 
             let threads = try await listedThreads(endpoint: endpoint)
             let observedAt = now()
-            let snapshot = snapshotKinds(threads)
-            let currentSnapshot = snapshot.kinds
-            var events = currentSnapshot.compactMap { sessionID, kind -> RawSourceEvent? in
-                guard structuralSnapshot[sessionID] != kind else { return nil }
+            let snapshot = snapshotFacts(threads)
+            let currentSnapshot = snapshot.facts
+            var events = currentSnapshot.compactMap { sessionID, fact -> RawSourceEvent? in
+                guard structuralSnapshot[sessionID] != fact,
+                      let kind = fact.eventKind else {
+                    return nil
+                }
                 return rawEvent(
                     sessionID: sessionID,
                     turnID: nil,
@@ -787,18 +816,31 @@ public actor AppServerSource: EventSource {
                 )
             }.sorted { $0.sessionID < $1.sessionID }
             structuralSnapshot = currentSnapshot
-            var malformed = !snapshot.conflictedSessionIDs.isEmpty
+            var malformed = snapshot.malformed
             for data in try await transport.drainNotifications(at: endpoint) {
                 do {
-                    if let event = try eventFromNotification(data, observedAt: observedAt) {
-                        if event.turnID == nil, event.itemID == nil {
-                            guard !snapshot.conflictedSessionIDs.contains(event.sessionID),
-                                  structuralSnapshot[event.sessionID] != event.kind else {
-                                continue
-                            }
-                            structuralSnapshot[event.sessionID] = event.kind
+                    switch try notificationFact(data, observedAt: observedAt) {
+                    case let .structural(sessionID, fact):
+                        guard !snapshot.excludedSessionIDs.contains(sessionID),
+                              structuralSnapshot[sessionID] != fact else {
+                            continue
                         }
+                        structuralSnapshot[sessionID] = fact
+                        if let kind = fact.eventKind {
+                            events.append(
+                                rawEvent(
+                                    sessionID: sessionID,
+                                    turnID: nil,
+                                    itemID: nil,
+                                    kind: kind,
+                                    observedAt: observedAt
+                                )
+                            )
+                        }
+                    case let .event(event):
                         events.append(event)
+                    case .ignored:
+                        break
                     }
                 } catch {
                     malformed = true
@@ -845,6 +887,10 @@ public actor AppServerSource: EventSource {
         if let version = result["protocolVersion"],
            !(version is NSNull),
            (version as? String) != Self.supportedProtocolVersion {
+            throw AppServerSourceFailure.unsupportedVersion
+        }
+        guard let userAgent = result["userAgent"] as? String,
+              Self.supportsHistoryFreeResume(userAgent: userAgent) else {
             throw AppServerSourceFailure.unsupportedVersion
         }
         try await transport.notify(
@@ -894,6 +940,7 @@ public actor AppServerSource: EventSource {
             var params: [String: Any] = [
                 "limit": 100,
                 "sourceKinds": Self.allSourceKinds,
+                "useStateDbOnly": true,
             ]
             if let cursor { params["cursor"] = cursor }
             let page = try await request(
@@ -915,15 +962,50 @@ public actor AppServerSource: EventSource {
         in page: [String: Any],
         seenCursors: inout Set<String>
     ) throws -> String? {
-        guard let rawCursor = page["nextCursor"] else {
-            throw AppServerSourceFailure.malformedMessage
-        }
+        guard let rawCursor = page["nextCursor"] else { return nil }
         if rawCursor is NSNull { return nil }
         guard let cursor = rawCursor as? String,
               seenCursors.insert(cursor).inserted else {
             throw AppServerSourceFailure.malformedMessage
         }
         return cursor
+    }
+
+    private static func supportsHistoryFreeResume(userAgent: String) -> Bool {
+        guard let slash = userAgent.firstIndex(of: "/") else { return false }
+        let originator = String(userAgent[..<slash])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !originator.isEmpty else { return false }
+        let versionStart = userAgent.index(after: slash)
+        guard versionStart < userAgent.endIndex,
+              let versionToken = userAgent[versionStart...]
+                .split(whereSeparator: \.isWhitespace)
+                .first else {
+            return false
+        }
+        let numericCore = String(versionToken)
+            .components(separatedBy: CharacterSet(charactersIn: "-+"))
+            .first ?? ""
+        let components = numericCore.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard components.count == 3 else { return false }
+        var version: [Int] = []
+        for component in components {
+            guard !component.isEmpty,
+                  component.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                  let value = Int(component) else {
+                return false
+            }
+            version.append(value)
+        }
+        // First verified tagged descendant of history-free resume support.
+        let minimum = [0, 144, 0]
+        for (value, required) in zip(version, minimum) where value != required {
+            return value > required
+        }
+        return true
     }
 
     private func request(
@@ -1007,30 +1089,49 @@ public actor AppServerSource: EventSource {
         return type == "f" || type == "d"
     }
 
-    private func snapshotKinds(_ threads: [[String: Any]]) -> SnapshotFold {
-        var kinds: [String: ObservedEvent.Kind] = [:]
-        var conflictedSessionIDs = Set<String>()
+    private func snapshotFacts(_ threads: [[String: Any]]) -> SnapshotFold {
+        var facts: [String: ThreadStatusFact] = [:]
+        var excludedSessionIDs = Set<String>()
+        var malformed = false
         for thread in threads {
             guard let sessionID = thread["id"] as? String,
-                  let status = thread["status"] as? [String: Any],
-                  let kind = kindFromThreadStatus(status) else {
+                  !sessionID.isEmpty else {
+                malformed = true
                 continue
             }
-            guard !conflictedSessionIDs.contains(sessionID) else { continue }
-            if let existing = kinds[sessionID], existing != kind {
-                kinds.removeValue(forKey: sessionID)
-                conflictedSessionIDs.insert(sessionID)
-            } else {
-                kinds[sessionID] = kind
+            guard !excludedSessionIDs.contains(sessionID) else { continue }
+            guard let status = thread["status"] as? [String: Any] else {
+                facts.removeValue(forKey: sessionID)
+                excludedSessionIDs.insert(sessionID)
+                malformed = true
+                continue
+            }
+            do {
+                let fact = try threadStatusFact(status)
+                if let existing = facts[sessionID], existing != fact {
+                    facts.removeValue(forKey: sessionID)
+                    excludedSessionIDs.insert(sessionID)
+                    malformed = true
+                } else {
+                    facts[sessionID] = fact
+                }
+            } catch {
+                facts.removeValue(forKey: sessionID)
+                excludedSessionIDs.insert(sessionID)
+                malformed = true
             }
         }
-        return SnapshotFold(kinds: kinds, conflictedSessionIDs: conflictedSessionIDs)
+        return SnapshotFold(
+            facts: facts,
+            excludedSessionIDs: excludedSessionIDs,
+            malformed: malformed
+        )
     }
 
-    private func eventFromNotification(
+    private func notificationFact(
         _ data: Data,
         observedAt: Date
-    ) throws -> RawSourceEvent? {
+    ) throws -> AppServerNotificationFact {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let method = object["method"] as? String,
               let params = object["params"] as? [String: Any] else {
@@ -1040,16 +1141,13 @@ public actor AppServerSource: EventSource {
         switch method {
         case "thread/status/changed":
             guard let sessionID = params["threadId"] as? String,
-                  let status = params["status"] as? [String: Any],
-                  let kind = kindFromThreadStatus(status) else {
+                  !sessionID.isEmpty,
+                  let status = params["status"] as? [String: Any] else {
                 throw AppServerSourceFailure.malformedMessage
             }
-            return rawEvent(
+            return .structural(
                 sessionID: sessionID,
-                turnID: nil,
-                itemID: nil,
-                kind: kind,
-                observedAt: observedAt
+                fact: try threadStatusFact(status)
             )
         case "turn/started":
             guard let sessionID = params["threadId"] as? String,
@@ -1057,12 +1155,14 @@ public actor AppServerSource: EventSource {
                   let turnID = turn["id"] as? String else {
                 throw AppServerSourceFailure.malformedMessage
             }
-            return rawEvent(
-                sessionID: sessionID,
-                turnID: turnID,
-                itemID: nil,
-                kind: .turnStarted,
-                observedAt: observedAt
+            return .event(
+                rawEvent(
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    itemID: nil,
+                    kind: .turnStarted,
+                    observedAt: observedAt
+                )
             )
         case "turn/completed":
             guard let sessionID = params["threadId"] as? String,
@@ -1072,12 +1172,14 @@ public actor AppServerSource: EventSource {
                   let kind = terminalKind(status) else {
                 throw AppServerSourceFailure.malformedMessage
             }
-            return rawEvent(
-                sessionID: sessionID,
-                turnID: turnID,
-                itemID: nil,
-                kind: kind,
-                observedAt: observedAt
+            return .event(
+                rawEvent(
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    itemID: nil,
+                    kind: kind,
+                    observedAt: observedAt
+                )
             )
         case "item/started", "item/completed":
             guard let sessionID = params["threadId"] as? String,
@@ -1106,34 +1208,50 @@ public actor AppServerSource: EventSource {
             case "contextCompaction":
                 kind = .contextCompaction
             default:
-                return nil
+                return .ignored
             }
-            return rawEvent(
-                sessionID: sessionID,
-                turnID: turnID,
-                itemID: itemID,
-                kind: kind,
-                observedAt: observedAt,
-                toolName: whitelistedToolType(itemType),
-                durationMilliseconds: duration
+            return .event(
+                rawEvent(
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    itemID: itemID,
+                    kind: kind,
+                    observedAt: observedAt,
+                    toolName: whitelistedToolType(itemType),
+                    durationMilliseconds: duration
+                )
             )
         default:
-            return nil
+            return .ignored
         }
     }
 
-    private func kindFromThreadStatus(_ status: [String: Any]) -> ObservedEvent.Kind? {
-        guard status["type"] as? String == "active" else { return nil }
-        let flags = Set(status["activeFlags"] as? [String] ?? [])
-        if flags.contains("waitingOnApproval")
-            || (status["waitingOnApproval"] as? Bool) == true {
-            return .waitingForApproval
+    private func threadStatusFact(_ status: [String: Any]) throws -> ThreadStatusFact {
+        guard let type = status["type"] as? String else {
+            throw AppServerSourceFailure.malformedMessage
         }
-        if flags.contains("waitingOnUserInput")
-            || (status["waitingOnUserInput"] as? Bool) == true {
-            return .waitingForUser
+        switch type {
+        case "active":
+            guard let activeFlags = status["activeFlags"] as? [String] else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            let documentedFlags = Set(["waitingOnApproval", "waitingOnUserInput"])
+            guard activeFlags.allSatisfy(documentedFlags.contains) else {
+                throw AppServerSourceFailure.malformedMessage
+            }
+            let flags = Set(activeFlags)
+            if flags.contains("waitingOnApproval") { return .waitingForApproval }
+            if flags.contains("waitingOnUserInput") { return .waitingForUser }
+            return .active
+        case "idle":
+            return .idle
+        case "systemError":
+            return .systemError
+        case "notLoaded":
+            return .notLoaded
+        default:
+            throw AppServerSourceFailure.malformedMessage
         }
-        return .modelActivity
     }
 
     private func terminalKind(_ status: String) -> ObservedEvent.Kind? {
@@ -1175,9 +1293,36 @@ public actor AppServerSource: EventSource {
     }
 }
 
+private enum ThreadStatusFact: Equatable {
+    case active
+    case waitingForApproval
+    case waitingForUser
+    case idle
+    case systemError
+    case notLoaded
+
+    var eventKind: ObservedEvent.Kind? {
+        switch self {
+        case .active: return .modelActivity
+        case .waitingForApproval: return .waitingForApproval
+        case .waitingForUser: return .waitingForUser
+        case .idle: return .completed
+        case .systemError: return .failed
+        case .notLoaded: return nil
+        }
+    }
+}
+
+private enum AppServerNotificationFact {
+    case structural(sessionID: String, fact: ThreadStatusFact)
+    case event(RawSourceEvent)
+    case ignored
+}
+
 private struct SnapshotFold {
-    let kinds: [String: ObservedEvent.Kind]
-    let conflictedSessionIDs: Set<String>
+    let facts: [String: ThreadStatusFact]
+    let excludedSessionIDs: Set<String>
+    let malformed: Bool
 }
 
 private enum AppServerSourceFailure: Error {
