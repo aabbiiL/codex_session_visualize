@@ -263,7 +263,7 @@ public struct EvidenceNormalizer: Sendable {
         case .modelActivity:
             return "01"
         case let .toolStarted(processID):
-            return "02-\(processID)"
+            return processID.map { "02-\($0)" } ?? "02-none"
         case let .processAlive(processID):
             return "03-\(processID)"
         case .waitingForApproval:

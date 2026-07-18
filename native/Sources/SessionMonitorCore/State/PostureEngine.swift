@@ -373,7 +373,7 @@ public struct PostureEngine: Sendable {
 
     private func latestActiveTool(in events: [ObservedEvent]) -> ActiveTool? {
         let orderedEvents = indexedEvents(in: events)
-        let starts = orderedEvents.compactMap { indexedEvent -> (IndexedEvent, Int32)? in
+        let starts = orderedEvents.compactMap { indexedEvent -> (IndexedEvent, Int32?)? in
             guard case let .toolStarted(processID) = indexedEvent.event.kind else {
                 return nil
             }
@@ -391,13 +391,15 @@ public struct PostureEngine: Sendable {
             return nil
         }
 
-        let liveness = orderedEvents.filter { indexedEvent in
-            guard case let .processAlive(processID) = indexedEvent.event.kind else {
-                return false
-            }
-            return processID == latestStart.1
-                && eventOccursAfter(indexedEvent, latestStart.0)
-        }.max { eventPrecedes($0, $1) }
+        let liveness = latestStart.1.flatMap { startedProcessID in
+            orderedEvents.filter { indexedEvent in
+                guard case let .processAlive(processID) = indexedEvent.event.kind else {
+                    return false
+                }
+                return processID == startedProcessID
+                    && eventOccursAfter(indexedEvent, latestStart.0)
+            }.max { eventPrecedes($0, $1) }
+        }
 
         return ActiveTool(started: latestStart.0.event, liveness: liveness?.event)
     }

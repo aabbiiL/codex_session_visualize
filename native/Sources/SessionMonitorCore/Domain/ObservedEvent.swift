@@ -42,7 +42,7 @@ public struct ObservedEvent: Codable, Hashable, Sendable {
     public enum Kind: Codable, Hashable, Sendable {
         case turnStarted
         case modelActivity
-        case toolStarted(processID: Int32)
+        case toolStarted(processID: Int32?)
         case processAlive(Int32)
         case waitingForApproval
         case waitingForUser

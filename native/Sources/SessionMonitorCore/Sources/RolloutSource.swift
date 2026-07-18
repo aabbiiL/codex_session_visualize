@@ -5,6 +5,7 @@ public struct RolloutSource: EventSource {
 
     private let session: SessionDescriptor
     private let reader: IncrementalFileReader
+    private let contextStore: RolloutContextStore
 
     public init(
         session: SessionDescriptor,
@@ -12,6 +13,7 @@ public struct RolloutSource: EventSource {
     ) {
         self.session = session
         self.reader = reader
+        self.contextStore = RolloutContextStore(sessionID: session.id)
     }
 
     public func poll(since cursor: SourceCursor?) async -> SourcePollResult {
@@ -24,7 +26,9 @@ public struct RolloutSource: EventSource {
         let fileURL = URL(fileURLWithPath: rolloutPath)
         let fileCursor = cursor?.source == id ? cursor?.filePosition : nil
         let read = await reader.readLines(at: fileURL, since: fileCursor)
-        var context = RolloutContext(sessionID: session.id, turnID: nil)
+        var context = await contextStore.snapshot(
+            reset: fileCursor == nil || read.rotation != nil
+        )
         var events: [RawSourceEvent] = []
         var issues = sourceIssues(from: read.issues, path: fileURL.path)
         let observedAt = Date()
@@ -52,6 +56,7 @@ public struct RolloutSource: EventSource {
                 )
             }
         }
+        await contextStore.store(context)
 
         return SourcePollResult(
             events: events,
@@ -150,12 +155,9 @@ public struct RolloutSource: EventSource {
         }
         switch payloadType {
         case "function_call":
-            guard let processID = payload.processID else {
-                return nil
-            }
             return rawEvent(
                 payload: payload,
-                kind: .toolStarted(processID: processID),
+                kind: .toolStarted(processID: payload.processID),
                 eventTime: eventTime,
                 observedAt: observedAt,
                 context: context,
@@ -222,9 +224,30 @@ public struct RolloutSource: EventSource {
     }
 }
 
-private struct RolloutContext {
+private struct RolloutContext: Sendable {
     var sessionID: String
     var turnID: String?
+}
+
+private actor RolloutContextStore {
+    private let descriptorSessionID: String
+    private var context: RolloutContext
+
+    init(sessionID: String) {
+        descriptorSessionID = sessionID
+        context = RolloutContext(sessionID: sessionID, turnID: nil)
+    }
+
+    func snapshot(reset: Bool) -> RolloutContext {
+        if reset {
+            context = RolloutContext(sessionID: descriptorSessionID, turnID: nil)
+        }
+        return context
+    }
+
+    func store(_ context: RolloutContext) {
+        self.context = context
+    }
 }
 
 private struct RolloutOuterRecord: Decodable {

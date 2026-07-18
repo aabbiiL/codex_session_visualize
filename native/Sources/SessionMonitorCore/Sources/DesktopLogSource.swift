@@ -29,22 +29,25 @@ public struct DesktopLogSource: EventSource {
 
         for (index, data) in read.lines.enumerated() where !data.isEmpty {
             let line = String(decoding: data, as: UTF8.self)
-            if line.contains("renderer_unhandled_error") {
+            guard let record = structuralRecord(for: line) else {
+                continue
+            }
+            if record.eventName == "renderer_unhandled_error" {
                 issues.append(
                     .rendererError(
                         path: fileURL.path,
-                        code: token(named: "code", in: line) ?? "unknown",
+                        code: record.metadata["code"] ?? "unknown",
                         lineNumber: index + 1
                     )
                 )
                 continue
             }
 
-            guard let mapping = eventMapping(for: line) else {
+            guard let mapping = eventMapping(for: record.eventName) else {
                 continue
             }
-            guard let timestamp = firstToken(in: line).flatMap(parseTimestamp),
-                  let sessionID = token(named: "session_id", in: line) else {
+            guard let timestamp = parseTimestamp(record.timestamp),
+                  let sessionID = record.metadata["session_id"] else {
                 issues.append(
                     .malformedLine(path: fileURL.path, lineNumber: index + 1)
                 )
@@ -54,16 +57,16 @@ public struct DesktopLogSource: EventSource {
             events.append(
                 RawSourceEvent(
                     sessionID: sessionID,
-                    turnID: token(named: "turn_id", in: line),
-                    itemID: token(named: "item_id", in: line),
+                    turnID: record.metadata["turn_id"],
+                    itemID: record.metadata["item_id"],
                     kind: mapping.kind,
                     eventTime: timestamp,
                     observedAt: observedAt,
                     source: id,
-                    durationMilliseconds: token(named: "duration_ms", in: line)
+                    durationMilliseconds: record.metadata["duration_ms"]
                         .flatMap { Int($0) },
                     errorCode: mapping.includesErrorCode
-                        ? token(named: "error_code", in: line)
+                        ? record.metadata["error_code"]
                         : nil
                 )
             )
@@ -99,40 +102,53 @@ public struct DesktopLogSource: EventSource {
         }.last
     }
 
-    private func eventMapping(for line: String) -> DesktopEventMapping? {
-        if line.contains("chatgpt_turn_started") {
+    private func eventMapping(for eventName: String) -> DesktopEventMapping? {
+        if eventName == "chatgpt_turn_started" {
             return DesktopEventMapping(kind: .turnStarted)
         }
-        if line.contains("chatgpt_response_routed") {
+        if eventName == "chatgpt_response_routed" {
             return DesktopEventMapping(kind: .modelActivity)
         }
-        if line.contains("chatgpt_pubsub_transport_closed") {
+        if eventName == "chatgpt_pubsub_transport_closed" {
             return DesktopEventMapping(kind: .transportRetry, includesErrorCode: true)
         }
-        if line.contains("chatgpt_pubsub_transport_opened") {
+        if eventName == "chatgpt_pubsub_transport_opened" {
             return DesktopEventMapping(kind: .transportRecovered)
         }
-        if line.contains("chatgpt_item_completed") {
+        if eventName == "chatgpt_item_completed" {
             return DesktopEventMapping(kind: .modelActivity)
         }
         return nil
     }
 
-    private func firstToken(in line: String) -> String? {
-        guard let end = line.firstIndex(where: { $0.isWhitespace }) else {
-            return line.isEmpty ? nil : line
-        }
-        return String(line[..<end])
-    }
-
-    private func token(named name: String, in line: String) -> String? {
-        let marker = "\(name)="
-        guard let markerRange = line.range(of: marker) else {
+    private func structuralRecord(for line: String) -> DesktopStructuralRecord? {
+        let tokens = line.split(whereSeparator: { $0.isWhitespace })
+        guard tokens.count >= 3 else {
             return nil
         }
-        let remainder = line[markerRange.upperBound...]
-        let end = remainder.firstIndex(where: { $0.isWhitespace }) ?? remainder.endIndex
-        var value = String(remainder[..<end])
+
+        var metadata: [String: String] = [:]
+        for token in tokens.dropFirst(3) {
+            guard let separator = token.firstIndex(of: "=") else {
+                break
+            }
+            let name = String(token[..<separator])
+            guard DesktopStructuralRecord.allowedMetadataNames.contains(name) else {
+                break
+            }
+            let valueStart = token.index(after: separator)
+            metadata[name] = unquoted(String(token[valueStart...]))
+        }
+
+        return DesktopStructuralRecord(
+            timestamp: String(tokens[0]),
+            eventName: String(tokens[2]),
+            metadata: metadata
+        )
+    }
+
+    private func unquoted(_ token: String) -> String {
+        var value = token
         if value.first == "\"", value.last == "\"", value.count >= 2 {
             value.removeFirst()
             value.removeLast()
@@ -171,4 +187,19 @@ private struct DesktopEventMapping {
         self.kind = kind
         self.includesErrorCode = includesErrorCode
     }
+}
+
+private struct DesktopStructuralRecord {
+    static let allowedMetadataNames: Set<String> = [
+        "session_id",
+        "turn_id",
+        "item_id",
+        "duration_ms",
+        "error_code",
+        "code",
+    ]
+
+    let timestamp: String
+    let eventName: String
+    let metadata: [String: String]
 }
