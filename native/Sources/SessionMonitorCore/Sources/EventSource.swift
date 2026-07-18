@@ -81,6 +81,14 @@ public enum SourceIssue: Codable, Hashable, Sendable {
     case rendererError(path: String, code: String, lineNumber: Int)
     case lineTooLong(path: String, limitBytes: Int)
     case pollLimitReached(path: String, limitBytes: Int)
+    case appServerProtocol(AppServerProtocolIssue)
+}
+
+public enum AppServerProtocolIssue: String, Codable, Hashable, Sendable {
+    case responseIDMismatch
+    case unsupportedVersion
+    case malformedMessage
+    case transportViolation
 }
 
 public struct SpawnRelationship: Codable, Hashable, Sendable {
