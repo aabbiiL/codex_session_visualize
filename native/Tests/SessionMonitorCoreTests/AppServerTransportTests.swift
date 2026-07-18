@@ -8,7 +8,7 @@ final class AppServerTransportTests: XCTestCase {
             "{\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-01\"}}".utf8
         )
         let threadListResponse = Data(
-            "{\"id\":2,\"result\":{\"data\":[],\"nextCursor\":null}}".utf8
+            "{\"id\":3,\"result\":{\"data\":[],\"nextCursor\":null}}".utf8
         )
         let stream = ScriptedUnixSocketByteStream(reads: [
             Data(
@@ -21,6 +21,7 @@ final class AppServerTransportTests: XCTestCase {
                 ].joined().utf8
             ),
             serverTextFrame(initializeResponse),
+            serverTextFrame(Data("{\"id\":2,\"result\":{\"data\":[],\"nextCursor\":null}}".utf8)),
             serverTextFrame(threadListResponse),
             Data(),
         ])
@@ -47,7 +48,7 @@ final class AppServerTransportTests: XCTestCase {
         XCTAssertEqual(result.health, SourceHealth(status: .healthy))
         XCTAssertTrue(result.events.isEmpty)
         XCTAssertEqual(connectionCount, 1, "One upgraded stream must serve the full source handshake")
-        XCTAssertEqual(writes.count, 4, "Expected one HTTP upgrade and three WebSocket messages")
+        XCTAssertEqual(writes.count, 5, "Expected one HTTP upgrade and four WebSocket messages")
 
         let upgrade = String(decoding: writes[0], as: UTF8.self)
         XCTAssertTrue(upgrade.hasPrefix("GET /codex-app-server HTTP/1.1\r\n"))
@@ -66,16 +67,110 @@ final class AppServerTransportTests: XCTestCase {
             try wireMethodAndID(clientMessages[1]),
             WireMessage(method: "initialized", id: nil)
         )
-        XCTAssertEqual(
-            try wireMethodAndID(clientMessages[2]),
-            WireMessage(method: "thread/list", id: 2)
-        )
+        XCTAssertEqual(try wireMethodAndID(clientMessages[2]), WireMessage(method: "thread/loaded/list", id: 2))
+        XCTAssertEqual(try wireMethodAndID(clientMessages[3]), WireMessage(method: "thread/list", id: 3))
         for message in clientMessages {
             let object = try XCTUnwrap(
                 try JSONSerialization.jsonObject(with: message) as? [String: Any]
             )
             XCTAssertNil(object["jsonrpc"], "Codex App Server omits jsonrpc on the wire")
         }
+    }
+
+    func testNotificationBeforeResponseIsQueuedWhileExactResponseIsReturned() async throws {
+        let notification = Data(
+            #"{"method":"thread/status/changed","params":{"threadId":"interleaved","status":{"type":"active","activeFlags":[]}}}"#.utf8
+        )
+        let response = Data(#"{"id":1,"result":{"ok":true}}"#.utf8)
+        let stream = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(notification), serverTextFrame(response), Data(),
+        ])
+        let transport = makeTransport(factory: RecordingUnixSocketByteStreamFactory(stream: stream))
+        let endpoint = transportEndpoint()
+
+        let returned = try await transport.request(
+            Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+            at: endpoint
+        )
+        let queued = try await transport.drainNotifications(at: endpoint)
+
+        XCTAssertEqual(returned, response)
+        XCTAssertEqual(queued, [notification])
+    }
+
+    func testResponseIDsRejectBooleanFractionalAndStringLookalikes() async throws {
+        for invalidID in ["true", "1.5", "\"1\""] {
+            let stream = ScriptedUnixSocketByteStream(reads: [
+                upgradeResponse(),
+                serverTextFrame(Data("{\"id\":\(invalidID),\"result\":{}}".utf8)),
+            ])
+            let transport = makeTransport(
+                factory: RecordingUnixSocketByteStreamFactory(stream: stream)
+            )
+
+            do {
+                _ = try await transport.request(
+                    Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+                    at: transportEndpoint()
+                )
+                XCTFail("Expected exact integer response ID rejection for \(invalidID)")
+            } catch {
+                XCTAssertEqual(error as? AppServerTransportFailure, .protocolViolation)
+            }
+        }
+    }
+
+    func testPingBeforeResponseSendsMaskedPongAndFragmentedTextIsReassembled() async throws {
+        let response = Data(#"{"id":1,"result":{"ok":true}}"#.utf8)
+        let split = response.count / 2
+        let stream = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(),
+            serverFrame(opcode: 0x9, final: true, payload: Data("ping".utf8)),
+            serverFrame(opcode: 0x1, final: false, payload: response.prefix(split)),
+            serverFrame(opcode: 0x0, final: true, payload: response.dropFirst(split)),
+        ])
+        let transport = makeTransport(factory: RecordingUnixSocketByteStreamFactory(stream: stream))
+
+        let returned = try await transport.request(
+            Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+            at: transportEndpoint()
+        )
+        let writes = await stream.recordedWrites()
+        let pong = try decodeMaskedClientFrame(writes[2])
+
+        XCTAssertEqual(returned, response)
+        XCTAssertEqual(pong.opcode, 0xA)
+        XCTAssertEqual(pong.payload, Data("ping".utf8))
+    }
+
+    func testCloseFrameInvalidatesStreamAndNextRequestReconnects() async throws {
+        let first = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverFrame(opcode: 0x8, final: true, payload: Data()),
+        ])
+        let expected = Data(#"{"id":2,"result":{"ok":true}}"#.utf8)
+        let second = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(expected),
+        ])
+        let factory = SequencedUnixSocketByteStreamFactory(streams: [first, second])
+        let transport = makeTransport(factory: factory)
+
+        do {
+            _ = try await transport.request(
+                Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+                at: transportEndpoint()
+            )
+            XCTFail("Expected close frame to end the first connection")
+        } catch {
+            XCTAssertEqual(error as? AppServerTransportFailure, .connectionClosed)
+        }
+        let returned = try await transport.request(
+            Data(#"{"id":2,"method":"fixture/request","params":{}}"#.utf8),
+            at: transportEndpoint()
+        )
+        let connectionCount = await factory.connectionCount()
+
+        XCTAssertEqual(returned, expected)
+        XCTAssertEqual(connectionCount, 2)
     }
 }
 
@@ -121,6 +216,20 @@ private actor RecordingUnixSocketByteStreamFactory: UnixSocketByteStreamFactory 
     func connectionCount() -> Int { openedSocketURLs.count }
 }
 
+private actor SequencedUnixSocketByteStreamFactory: UnixSocketByteStreamFactory {
+    private var streams: [ScriptedUnixSocketByteStream]
+    private var connections = 0
+
+    init(streams: [ScriptedUnixSocketByteStream]) { self.streams = streams }
+
+    func open(socketURL: URL) async throws -> any UnixSocketByteStream {
+        connections += 1
+        return streams.removeFirst()
+    }
+
+    func connectionCount() -> Int { connections }
+}
+
 private struct WireMessage: Equatable {
     let method: String
     let id: Int?
@@ -141,6 +250,59 @@ private func serverTextFrame(_ payload: Data) -> Data {
     var frame = Data([0x81, UInt8(payload.count)])
     frame.append(payload)
     return frame
+}
+
+private func serverFrame<T: DataProtocol>(opcode: UInt8, final: Bool, payload: T) -> Data {
+    let data = Data(payload)
+    precondition(data.count < 126)
+    var frame = Data([(final ? 0x80 : 0x00) | opcode, UInt8(data.count)])
+    frame.append(data)
+    return frame
+}
+
+private struct DecodedClientFrame {
+    let opcode: UInt8
+    let payload: Data
+}
+
+private func decodeMaskedClientFrame(_ frame: Data) throws -> DecodedClientFrame {
+    let bytes = [UInt8](frame)
+    XCTAssertGreaterThanOrEqual(bytes.count, 6)
+    XCTAssertNotEqual(bytes[1] & 0x80, 0)
+    let length = Int(bytes[1] & 0x7F)
+    XCTAssertLessThan(length, 126)
+    let mask = Array(bytes[2..<6])
+    let payload = Data((0..<length).map { bytes[6 + $0] ^ mask[$0 % 4] })
+    return DecodedClientFrame(opcode: bytes[0] & 0x0F, payload: payload)
+}
+
+private func upgradeResponse() -> Data {
+    Data(
+        [
+            "HTTP/1.1 101 Switching Protocols\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n",
+            "\r\n",
+        ].joined().utf8
+    )
+}
+
+private func transportEndpoint() -> AppServerEndpoint {
+    .unixWebSocket(
+        socketURL: URL(fileURLWithPath: "/tmp/scrubbed-app-server.sock"),
+        requestPath: "/"
+    )
+}
+
+private func makeTransport(
+    factory: any UnixSocketByteStreamFactory
+) -> UnixWebSocketAppServerTransport {
+    UnixWebSocketAppServerTransport(
+        streamFactory: factory,
+        webSocketKeyGenerator: { "dGhlIHNhbXBsZSBub25jZQ==" },
+        maskKeyGenerator: { [0x37, 0xFA, 0x21, 0x3D] }
+    )
 }
 
 private func decodeMaskedClientTextFrame(_ frame: Data) throws -> Data {

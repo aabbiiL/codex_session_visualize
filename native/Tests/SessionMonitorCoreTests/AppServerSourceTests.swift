@@ -38,8 +38,8 @@ final class AppServerSourceTests: XCTestCase {
     func testPollInitializesListsThreadsAndMapsStructuredNotificationsWithoutContent() async throws {
         let frames = try appServerFixtureFrames()
         let transport = FakeAppServerTransport(
-            responses: Array(frames.prefix(2)),
-            notifications: Array(frames.dropFirst(2))
+            responses: Array(frames.prefix(3)),
+            notifications: Array(frames.dropFirst(3))
         )
         let runner = RecordingConnectionRunner(
             output: "codex 1 user 1u IPv4 0 TCP 127.0.0.1:1->203.0.113.4:443 (ESTABLISHED)"
@@ -61,9 +61,10 @@ final class AppServerSourceTests: XCTestCase {
 
         XCTAssertEqual(source.id, .appServer)
         XCTAssertEqual(result.health, SourceHealth(status: .healthy))
-        XCTAssertEqual(exchange.requests.count, 2)
+        XCTAssertEqual(exchange.requests.count, 3)
         XCTAssertEqual(try methodAndID(in: exchange.requests[0]), WireCall(method: "initialize", id: 1))
-        XCTAssertEqual(try methodAndID(in: exchange.requests[1]), WireCall(method: "thread/list", id: 2))
+        XCTAssertEqual(try methodAndID(in: exchange.requests[1]), WireCall(method: "thread/loaded/list", id: 2))
+        XCTAssertEqual(try methodAndID(in: exchange.requests[2]), WireCall(method: "thread/list", id: 3))
         XCTAssertEqual(exchange.notifications.count, 1)
         XCTAssertEqual(
             try methodAndID(in: exchange.notifications[0]),
@@ -141,8 +142,8 @@ final class AppServerSourceTests: XCTestCase {
 
     func testEveryResponseIDMustExactlyMatchItsRequest() async {
         for mismatch in [
-            ([initializeResponse(id: 99), listResponse(id: 2)], 1),
-            ([initializeResponse(id: 1), listResponse(id: 99)], 2),
+            ([initializeResponse(id: 99)], 1),
+            ([initializeResponse(id: 1), loadedListResponse(id: 99)], 2),
         ] {
             let source = AppServerSource(
                 endpoint: .unixWebSocket(
@@ -262,6 +263,10 @@ private func initializeResponse(id: Int, version: String = "2026-07-01") -> Data
 }
 
 private func listResponse(id: Int) -> Data {
+    Data("{\"id\":\(id),\"result\":{\"data\":[],\"nextCursor\":null}}".utf8)
+}
+
+private func loadedListResponse(id: Int) -> Data {
     Data("{\"id\":\(id),\"result\":{\"data\":[],\"nextCursor\":null}}".utf8)
 }
 
