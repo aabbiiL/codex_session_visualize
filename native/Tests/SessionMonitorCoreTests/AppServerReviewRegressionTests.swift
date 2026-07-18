@@ -221,9 +221,8 @@ private func itemStarted(
     processID: Int? = nil
 ) -> Data {
     let process = processID.map { ",\"processId\":\($0)" } ?? ""
-    return Data(
-        "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thread-items\","
-            + "\"turnId\":\"turn-items\",\"item\":{\"id\":\"\(id)\",\"type\":\"\(type)\""
-            + process + ",\"\(bodyKey)\":\"FIXTURE_REVIEW_BODY_MUST_BE_DROPPED\"}}}".utf8
-    )
+    let json = "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thread-items\","
+        + "\"turnId\":\"turn-items\",\"item\":{\"id\":\"\(id)\",\"type\":\"\(type)\""
+        + process + ",\"\(bodyKey)\":\"FIXTURE_REVIEW_BODY_MUST_BE_DROPPED\"}}}"
+    return Data(json.utf8)
 }
