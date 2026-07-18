@@ -410,6 +410,7 @@ public struct PostureEngine: Sendable {
              .waitingForUser,
              .contextCompaction,
              .transportRetry,
+             .transportRecovered,
              .completed,
              .failed,
              .interrupted:

@@ -8,6 +8,9 @@ public struct RawSourceEvent: Codable, Hashable, Sendable {
     public let eventTime: Date
     public let observedAt: Date
     public let source: EvidenceSource
+    public let toolName: String?
+    public let durationMilliseconds: Int?
+    public let errorCode: String?
     public let structuredPlan: StructuredPlanPayload?
 
     public init(
@@ -18,7 +21,10 @@ public struct RawSourceEvent: Codable, Hashable, Sendable {
         eventTime: Date,
         observedAt: Date,
         source: EvidenceSource,
-        structuredPlan: StructuredPlanPayload?
+        toolName: String? = nil,
+        durationMilliseconds: Int? = nil,
+        errorCode: String? = nil,
+        structuredPlan: StructuredPlanPayload? = nil
     ) {
         self.sessionID = sessionID
         self.turnID = turnID
@@ -27,6 +33,9 @@ public struct RawSourceEvent: Codable, Hashable, Sendable {
         self.eventTime = eventTime
         self.observedAt = observedAt
         self.source = source
+        self.toolName = toolName
+        self.durationMilliseconds = durationMilliseconds
+        self.errorCode = errorCode
         self.structuredPlan = structuredPlan
     }
 }
@@ -265,12 +274,14 @@ public struct EvidenceNormalizer: Sendable {
             return "06"
         case .transportRetry:
             return "07"
-        case .completed:
+        case .transportRecovered:
             return "08"
-        case .failed:
+        case .completed:
             return "09"
-        case .interrupted:
+        case .failed:
             return "10"
+        case .interrupted:
+            return "11"
         }
     }
 }

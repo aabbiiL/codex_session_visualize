@@ -36,6 +36,24 @@ public struct SourceCursor: Codable, Hashable, Sendable {
         self.source = source
         self.opaqueValue = opaqueValue
     }
+
+    public init(source: EvidenceSource, filePosition: FileCursor) {
+        self.init(
+            source: source,
+            opaqueValue: "\(filePosition.device):\(filePosition.inode):\(filePosition.offset)"
+        )
+    }
+
+    public var filePosition: FileCursor? {
+        let components = opaqueValue.split(separator: ":", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              let device = UInt64(String(components[0])),
+              let inode = UInt64(String(components[1])),
+              let offset = UInt64(String(components[2])) else {
+            return nil
+        }
+        return FileCursor(device: device, inode: inode, offset: offset)
+    }
 }
 
 public struct SourceHealth: Codable, Hashable, Sendable {
@@ -59,6 +77,10 @@ public enum SourceIssue: Codable, Hashable, Sendable {
     case lockedDatabase(path: String)
     case unsupportedSchema(table: String, missingColumns: [String])
     case databaseError(path: String, code: Int32)
+    case malformedLine(path: String, lineNumber: Int)
+    case rendererError(path: String, code: String, lineNumber: Int)
+    case lineTooLong(path: String, limitBytes: Int)
+    case pollLimitReached(path: String, limitBytes: Int)
 }
 
 public struct SpawnRelationship: Codable, Hashable, Sendable {
@@ -92,6 +114,7 @@ public struct SourcePollResult: Codable, Hashable, Sendable {
     public let sessions: [SessionDescriptor]
     public let spawnRelationships: [SpawnRelationship]
     public let goals: [StructuredGoalStatus]
+    public let events: [RawSourceEvent]
     public let health: SourceHealth
     public let cursor: SourceCursor?
 
@@ -99,12 +122,14 @@ public struct SourcePollResult: Codable, Hashable, Sendable {
         sessions: [SessionDescriptor] = [],
         spawnRelationships: [SpawnRelationship] = [],
         goals: [StructuredGoalStatus] = [],
+        events: [RawSourceEvent] = [],
         health: SourceHealth,
         cursor: SourceCursor? = nil
     ) {
         self.sessions = sessions
         self.spawnRelationships = spawnRelationships
         self.goals = goals
+        self.events = events
         self.health = health
         self.cursor = cursor
     }

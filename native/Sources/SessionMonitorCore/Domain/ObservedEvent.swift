@@ -48,6 +48,7 @@ public struct ObservedEvent: Codable, Hashable, Sendable {
         case waitingForUser
         case contextCompaction
         case transportRetry
+        case transportRecovered
         case completed
         case failed
         case interrupted
@@ -66,7 +67,7 @@ public struct ObservedEvent: Codable, Hashable, Sendable {
         }
 
         var isModelActivity: Bool {
-            self == .modelActivity
+            self == .modelActivity || self == .transportRecovered
         }
     }
 
