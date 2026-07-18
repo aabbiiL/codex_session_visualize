@@ -83,8 +83,13 @@ final class AppServerReviewRegressionTests: XCTestCase {
             ]
         )
         XCTAssertEqual(requests.map(\.id), Array(1...8))
+        XCTAssertTrue(try requests[0].nestedBoolParam("experimentalApi", in: "capabilities"))
         XCTAssertEqual(try requests[2].stringParam("threadId"), "loaded-a")
         XCTAssertEqual(try requests[3].stringParam("threadId"), "loaded-b")
+        XCTAssertTrue(try requests[2].boolParam("excludeTurns"))
+        XCTAssertTrue(try requests[3].boolParam("excludeTurns"))
+        XCTAssertEqual(try requests[2].paramKeys(), Set(["threadId", "excludeTurns"]))
+        XCTAssertEqual(try requests[3].paramKeys(), Set(["threadId", "excludeTurns"]))
         XCTAssertEqual(try requests[5].stringParam("cursor"), "page-2")
         XCTAssertEqual(
             Set(try requests[4].stringArrayParam("sourceKinds")),
@@ -92,6 +97,187 @@ final class AppServerReviewRegressionTests: XCTestCase {
         )
         XCTAssertFalse(requests.contains { ["thread/start", "thread/restart", "turn/start"].contains($0.method) })
         XCTAssertEqual(requests.filter { $0.method == "thread/resume" }.count, 2, "Subscriptions are per connection")
+    }
+
+    func testExperimentalExcludeTurnsRejectionFailsOptionalSourceClosedWithoutHistoryFallback() async throws {
+        let transport = ReviewFakeAppServerTransport(steps: [
+            .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+            .response("thread/loaded/list", result: #"{"data":["loaded-old-server"],"nextCursor":null}"#),
+            .failure("thread/resume", AppServerTransportFailure.serverError(code: -32602)),
+        ])
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let result = await source.poll(since: nil)
+        let requests = await transport.recordedRequests()
+
+        XCTAssertEqual(result.health.status, .unavailable)
+        XCTAssertEqual(result.health.issues, [.appServerProtocol(.transportViolation)])
+        XCTAssertTrue(result.events.isEmpty)
+        XCTAssertEqual(requests.map(\.method), ["initialize", "thread/loaded/list", "thread/resume"])
+        XCTAssertTrue(try requests[0].nestedBoolParam("experimentalApi", in: "capabilities"))
+        XCTAssertTrue(try requests[2].boolParam("excludeTurns"))
+        XCTAssertEqual(try requests[2].paramKeys(), Set(["threadId", "excludeTurns"]))
+        XCTAssertEqual(
+            requests.filter { $0.method == "thread/resume" }.count,
+            1,
+            "Never retry resume without excludeTurns on older App Servers"
+        )
+    }
+
+    func testIdenticalDuplicateThreadRowsAcrossPagesDeduplicateToOneHealthyEvent() async {
+        let duplicate = listedThreadResult(id: "duplicate", status: "active")
+        let transport = ReviewFakeAppServerTransport(steps: [
+            .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+            .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+            .response("thread/list", result: pagedResult(rows: [duplicate], nextCursor: "page-2")),
+            .response("thread/list", result: pagedResult(rows: [duplicate], nextCursor: nil)),
+        ])
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let result = await source.poll(since: nil)
+
+        XCTAssertEqual(result.health, SourceHealth(status: .healthy))
+        XCTAssertEqual(result.events.map(\.sessionID), ["duplicate"])
+        XCTAssertEqual(result.events.map(\.kind), [.modelActivity])
+    }
+
+    func testConflictingDuplicateThreadRowsDegradeWithoutFalseActivity() async {
+        let active = listedThreadResult(id: "conflict", status: "active")
+        let waiting = listedThreadResult(
+            id: "conflict",
+            status: "active",
+            activeFlags: ["waitingOnApproval"]
+        )
+        let transport = ReviewFakeAppServerTransport(steps: [
+            .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+            .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+            .response("thread/list", result: pagedResult(rows: [active], nextCursor: "page-2")),
+            .response("thread/list", result: pagedResult(rows: [waiting], nextCursor: nil)),
+        ])
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let result = await source.poll(since: nil)
+
+        XCTAssertEqual(result.health.status, .degraded)
+        XCTAssertEqual(result.health.issues, [.appServerProtocol(.malformedMessage)])
+        XCTAssertFalse(result.events.contains { $0.sessionID == "conflict" })
+    }
+
+    func testIdenticalStatusNotificationIsSuppressedAcrossRepeatedPolls() async {
+        let row = listedThreadResult(id: "unchanged", status: "active")
+        let notification = threadStatusChanged(id: "unchanged", status: "active")
+        let transport = ReviewFakeAppServerTransport(
+            steps: [
+                .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: pagedResult(rows: [row], nextCursor: nil)),
+                .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                .response("thread/list", result: pagedResult(rows: [row], nextCursor: nil)),
+            ],
+            notificationBatches: [[notification], [notification]]
+        )
+        let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+        let first = await source.poll(since: nil)
+        let second = await source.poll(since: nil)
+
+        XCTAssertEqual(first.events.map(\.sessionID), ["unchanged"])
+        XCTAssertEqual(first.events.map(\.kind), [.modelActivity])
+        XCTAssertTrue(second.events.isEmpty, "Repeated identical notifications must not refresh activity")
+    }
+
+    func testRepeatedPaginationCursorTerminatesWithinConfiguredBound() async {
+        let transport = ReviewFakeAppServerTransport(steps: [
+            .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+            .response("thread/loaded/list", result: #"{"data":[],"nextCursor":"loop"}"#),
+            .response("thread/loaded/list", result: #"{"data":[],"nextCursor":"loop"}"#),
+        ])
+        let source = AppServerSource(
+            endpoint: endpoint,
+            transport: transport,
+            maximumPaginationPages: 2,
+            maximumPaginationItems: 4,
+            now: { self.fixedNow }
+        )
+
+        let result = await source.poll(since: nil)
+        let requests = await transport.recordedRequests()
+
+        XCTAssertEqual(result.health.status, .unavailable)
+        XCTAssertEqual(result.health.issues, [.appServerProtocol(.malformedMessage)])
+        XCTAssertTrue(result.events.isEmpty)
+        XCTAssertEqual(requests.filter { $0.method == "thread/loaded/list" }.count, 2)
+    }
+
+    func testPaginationItemCountTerminatesWithinConfiguredBound() async {
+        let rows = (1...3).map { listedThreadResult(id: "bounded-\($0)", status: "active") }
+        let transport = ReviewFakeAppServerTransport(steps: [
+            .response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+            .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+            .response("thread/list", result: pagedResult(rows: rows, nextCursor: nil)),
+        ])
+        let source = AppServerSource(
+            endpoint: endpoint,
+            transport: transport,
+            maximumPaginationPages: 2,
+            maximumPaginationItems: 2,
+            now: { self.fixedNow }
+        )
+
+        let result = await source.poll(since: nil)
+
+        XCTAssertEqual(result.health.status, .unavailable)
+        XCTAssertEqual(result.health.issues, [.appServerProtocol(.malformedMessage)])
+        XCTAssertTrue(result.events.isEmpty)
+    }
+
+    func testPaginationRejectsMissingOrWrongDataAndNonStringCursor() async {
+        let malformedCases: [(String, [ReviewStep])] = [
+            (
+                "loaded missing data",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"nextCursor":null}"#)]
+            ),
+            (
+                "loaded wrong data",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"data":"wrong","nextCursor":null}"#)]
+            ),
+            (
+                "loaded numeric cursor",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"data":[],"nextCursor":7}"#)]
+            ),
+            (
+                "listed missing data",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                 .response("thread/list", result: #"{"nextCursor":null}"#)]
+            ),
+            (
+                "listed wrong data",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                 .response("thread/list", result: #"{"data":"wrong","nextCursor":null}"#)]
+            ),
+            (
+                "listed numeric cursor",
+                [.response("initialize", result: #"{"protocolVersion":"2026-07-01"}"#),
+                 .response("thread/loaded/list", result: #"{"data":[],"nextCursor":null}"#),
+                 .response("thread/list", result: #"{"data":[],"nextCursor":7}"#)]
+            ),
+        ]
+
+        for (name, steps) in malformedCases {
+            let transport = ReviewFakeAppServerTransport(steps: steps)
+            let source = AppServerSource(endpoint: endpoint, transport: transport, now: { self.fixedNow })
+
+            let result = await source.poll(since: nil)
+
+            XCTAssertEqual(result.health.status, .unavailable, name)
+            XCTAssertEqual(result.health.issues, [.appServerProtocol(.malformedMessage)], name)
+            XCTAssertTrue(result.events.isEmpty, name)
+        }
     }
 
     func testItemKindsDoNotMasqueradeAsToolsAndContentIsDiscarded() async throws {
@@ -159,6 +345,19 @@ private struct ReviewRequest: Sendable {
         try XCTUnwrap(params()[key] as? [String])
     }
 
+    func boolParam(_ key: String) throws -> Bool {
+        try XCTUnwrap(params()[key] as? Bool)
+    }
+
+    func nestedBoolParam(_ key: String, in parent: String) throws -> Bool {
+        let object = try XCTUnwrap(params()[parent] as? [String: Any])
+        return try XCTUnwrap(object[key] as? Bool)
+    }
+
+    func paramKeys() throws -> Set<String> {
+        Set(try params().keys)
+    }
+
     private func params() throws -> [String: Any] {
         let object = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: payload) as? [String: Any]
@@ -212,6 +411,26 @@ private actor ReviewFakeAppServerTransport: AppServerTransport {
 
 private func resumedResult(_ threadID: String) -> String {
     "{\"thread\":{\"id\":\"\(threadID)\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"turns\":[]}}"
+}
+
+private func listedThreadResult(
+    id: String,
+    status: String,
+    activeFlags: [String] = []
+) -> String {
+    let flags = activeFlags.map { #""\#($0)""# }.joined(separator: ",")
+    return #"{"id":"\#(id)","status":{"type":"\#(status)","activeFlags":[\#(flags)]}}"#
+}
+
+private func pagedResult(rows: [String], nextCursor: String?) -> String {
+    let cursor = nextCursor.map { #""\#($0)""# } ?? "null"
+    return #"{"data":[\#(rows.joined(separator: ","))],"nextCursor":\#(cursor)}"#
+}
+
+private func threadStatusChanged(id: String, status: String) -> Data {
+    Data(
+        #"{"method":"thread/status/changed","params":{"threadId":"\#(id)","status":{"type":"\#(status)","activeFlags":[]}}}"#.utf8
+    )
 }
 
 private func itemStarted(

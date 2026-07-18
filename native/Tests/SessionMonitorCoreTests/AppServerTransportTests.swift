@@ -98,6 +98,53 @@ final class AppServerTransportTests: XCTestCase {
         XCTAssertEqual(queued, [notification])
     }
 
+    func testDifferentIDServerRequestIsDiscardedWithoutPoisoningClientResponses() async throws {
+        try await assertInterleavedServerRequestIsDiscarded(serverRequestID: 77)
+    }
+
+    func testCollidingIDServerRequestIsDiscardedWithoutBecomingClientResponse() async throws {
+        try await assertInterleavedServerRequestIsDiscarded(serverRequestID: 1)
+    }
+
+    func testMatchingErrorResponseThrowsTypedContentFreeErrorWithoutResettingConnection() async throws {
+        let secretMessage = "FIXTURE_ERR_SECRET"
+        let secretData = "FIXTURE_ERR_DATA"
+        let errorJSON = "{\"id\":1,\"error\":{\"code\":-32603,"
+            + "\"message\":\"\(secretMessage)\",\"data\":\"\(secretData)\"}}"
+        let errorResponse = Data(errorJSON.utf8)
+        let secondResponse = Data(#"{"id":2,"result":{"ok":true}}"#.utf8)
+        let stream = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(errorResponse), serverTextFrame(secondResponse), Data(),
+        ])
+        let factory = RecordingUnixSocketByteStreamFactory(stream: stream)
+        let transport = makeTransport(factory: factory)
+        let endpoint = transportEndpoint()
+        var caught: AppServerTransportFailure?
+
+        do {
+            _ = try await transport.request(
+                Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+                at: endpoint
+            )
+            XCTFail("A matching JSON-RPC error envelope must not be returned as a success response")
+        } catch let error as AppServerTransportFailure {
+            caught = error
+        }
+
+        let returned = try await transport.request(
+            Data(#"{"id":2,"method":"fixture/request","params":{}}"#.utf8),
+            at: endpoint
+        )
+        let retainedDescription = String(describing: caught)
+        let connectionCount = await factory.connectionCount()
+
+        XCTAssertEqual(caught, .serverError(code: -32603))
+        XCTAssertEqual(returned, secondResponse)
+        XCTAssertEqual(connectionCount, 1, "A server error is not a transport reset")
+        XCTAssertFalse(retainedDescription.contains(secretMessage))
+        XCTAssertFalse(retainedDescription.contains(secretData))
+    }
+
     func testResponseIDsRejectBooleanFractionalAndStringLookalikes() async throws {
         for invalidID in ["true", "1.5", "\"1\""] {
             let stream = ScriptedUnixSocketByteStream(reads: [
@@ -171,6 +218,45 @@ final class AppServerTransportTests: XCTestCase {
 
         XCTAssertEqual(returned, expected)
         XCTAssertEqual(connectionCount, 2)
+    }
+
+
+    private func assertInterleavedServerRequestIsDiscarded(serverRequestID: Int) async throws {
+        let secret = "FIXTURE_REQ_SECRET"
+        let serverRequestJSON = "{\"id\":\(serverRequestID),\"method\":\"server/request\","
+            + "\"params\":{\"secret\":\"\(secret)\"}}"
+        let serverRequest = Data(serverRequestJSON.utf8)
+        let firstResponse = Data(#"{"id":1,"result":{"sequence":1}}"#.utf8)
+        let secondResponse = Data(#"{"id":2,"result":{"sequence":2}}"#.utf8)
+        let stream = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(serverRequest),
+            serverTextFrame(firstResponse), serverTextFrame(secondResponse), Data(),
+        ])
+        let factory = RecordingUnixSocketByteStreamFactory(stream: stream)
+        let transport = makeTransport(factory: factory)
+        let endpoint = transportEndpoint()
+
+        let first = try await transport.request(
+            Data(#"{"id":1,"method":"fixture/first","params":{}}"#.utf8),
+            at: endpoint
+        )
+        let second = try await transport.request(
+            Data(#"{"id":2,"method":"fixture/second","params":{}}"#.utf8),
+            at: endpoint
+        )
+        let queued = try await transport.drainNotifications(at: endpoint)
+        let connectionCount = await factory.connectionCount()
+        var retained = Data()
+        retained.append(first)
+        retained.append(second)
+        queued.forEach { retained.append($0) }
+        let externallyRetained = String(decoding: retained, as: UTF8.self)
+
+        XCTAssertEqual(first, firstResponse)
+        XCTAssertEqual(second, secondResponse)
+        XCTAssertTrue(queued.isEmpty, "Server requests must not enter the notification queue")
+        XCTAssertEqual(connectionCount, 1)
+        XCTAssertFalse(externallyRetained.contains(secret))
     }
 }
 
