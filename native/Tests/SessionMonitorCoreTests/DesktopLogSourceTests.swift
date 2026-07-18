@@ -56,7 +56,7 @@ final class DesktopLogSourceTests: XCTestCase {
             result.health.issues,
             [
                 .rendererError(
-                    path: fixture.fileURL.resolvingSymlinksInPath().path,
+                    path: fixture.fileURL.standardizedFileURL.path,
                     code: "RENDERER_ONLY_42",
                     lineNumber: 6
                 ),
