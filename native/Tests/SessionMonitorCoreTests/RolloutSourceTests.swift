@@ -135,6 +135,63 @@ final class RolloutSourceTests: XCTestCase {
         XCTAssertEqual(second.health.status, .healthy)
         XCTAssertTrue(second.health.issues.isEmpty)
     }
+
+    func testFunctionCallWithoutProcessIDStillEmitsToolStartWithAbsentProcessHandle() async throws {
+        let leakedArguments = "LEAKED_TOOL_ARGUMENTS_WITHOUT_PROCESS_ID"
+        let fixture = try TemporaryRolloutFixture.completeLines([
+            """
+            {"timestamp":"2026-07-17T00:00:04.000Z","type":"response_item","payload":{"type":"function_call","session_id":"session-rollout-1","turn_id":"turn-rollout-1","item_id":"tool-call-without-process","name":"exec_command","arguments":"\(leakedArguments)"}}
+            """,
+        ])
+        defer { fixture.remove() }
+
+        let result = await RolloutSource(session: fixture.session).poll(since: nil)
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertEqual(result.events.count, 1)
+        let event = try XCTUnwrap(result.events.first)
+        XCTAssertEqual(event.kind, .toolStarted(processID: nil))
+        XCTAssertEqual(event.sessionID, "session-rollout-1")
+        XCTAssertEqual(event.turnID, "turn-rollout-1")
+        XCTAssertEqual(event.itemID, "tool-call-without-process")
+        XCTAssertEqual(event.toolName, "exec_command")
+        XCTAssertFalse(encoded.contains(leakedArguments))
+    }
+
+    func testIncrementalPollPreservesTurnContextForLaterIDLessEvent() async throws {
+        let leakedMessage = "LEAKED_LATER_EVENT_MESSAGE"
+        let fixture = try TemporaryRolloutFixture.completeLines([
+            """
+            {"timestamp":"2026-07-17T00:00:00.000Z","type":"session_meta","payload":{"id":"session-rollout-1"}}
+            """,
+            """
+            {"timestamp":"2026-07-17T00:00:01.000Z","type":"turn_context","payload":{"session_id":"session-rollout-1","turn_id":"turn-across-polls"}}
+            """,
+        ])
+        defer { fixture.remove() }
+        let source = RolloutSource(session: fixture.session)
+
+        let first = await source.poll(since: nil)
+        XCTAssertTrue(first.events.isEmpty)
+        XCTAssertEqual(first.health.status, .healthy)
+        let firstCursor = try XCTUnwrap(first.cursor)
+
+        try fixture.appendCompleteLine(
+            """
+            {"timestamp":"2026-07-17T00:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","item_id":"later-reasoning","message":"\(leakedMessage)"}}
+            """
+        )
+        let second = await source.poll(since: firstCursor)
+        let encoded = String(decoding: try JSONEncoder().encode(second), as: UTF8.self)
+
+        XCTAssertEqual(second.events.count, 1)
+        let event = try XCTUnwrap(second.events.first)
+        XCTAssertEqual(event.kind, .modelActivity)
+        XCTAssertEqual(event.sessionID, "session-rollout-1")
+        XCTAssertEqual(event.turnID, "turn-across-polls")
+        XCTAssertEqual(event.itemID, "later-reasoning")
+        XCTAssertFalse(encoded.contains(leakedMessage))
+    }
 }
 
 private struct TemporaryRolloutFixture {
@@ -156,6 +213,10 @@ private struct TemporaryRolloutFixture {
             {"timestamp":"2026-07-17T00:00:02.000Z","type":"event_msg","payload":{"type":"task_started","session_id":"session-rollout-1","turn_id":"turn-rollout-1"}}
             """ + "\n"
         return try make(contents: Data(line.utf8))
+    }
+
+    static func completeLines(_ lines: [String]) throws -> TemporaryRolloutFixture {
+        try make(contents: Data((lines.joined(separator: "\n") + "\n").utf8))
     }
 
     private static func make(contents: Data) throws -> TemporaryRolloutFixture {
@@ -184,6 +245,13 @@ private struct TemporaryRolloutFixture {
 
     func remove() {
         try? FileManager.default.removeItem(at: directoryURL)
+    }
+
+    func appendCompleteLine(_ line: String) throws {
+        let handle = try FileHandle(forWritingTo: fileURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((line + "\n").utf8))
     }
 }
 

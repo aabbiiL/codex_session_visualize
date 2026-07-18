@@ -104,6 +104,47 @@ final class DesktopLogSourceTests: XCTestCase {
         XCTAssertEqual(second.health.status, .healthy)
         XCTAssertTrue(second.health.issues.isEmpty)
     }
+
+    func testUnknownStructuralEventCannotMasqueradeAsTurnStartThroughBodyContent() async throws {
+        let leakedSessionID = "LEAKED_UNKNOWN_SESSION_ID"
+        let fixture = try TemporaryDesktopLogFixture.singleLine(
+            "2026-07-17T01:00:00.000Z INFO unrelated_desktop_event "
+                + "payload.message=\"chatgpt_turn_started session_id=\(leakedSessionID)\""
+        )
+        defer { fixture.remove() }
+
+        let result = await DesktopLogSource(logDirectory: fixture.directoryURL).poll(since: nil)
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertTrue(result.events.isEmpty)
+        XCTAssertEqual(result.health.status, .healthy)
+        XCTAssertTrue(result.health.issues.isEmpty)
+        XCTAssertFalse(encoded.contains(leakedSessionID))
+    }
+
+    func testStructuralEventMissingSessionIDDoesNotRecoverItFromBodyContent() async throws {
+        let leakedSessionID = "LEAKED_MISSING_STRUCTURAL_SESSION_ID"
+        let fixture = try TemporaryDesktopLogFixture.singleLine(
+            "2026-07-17T01:00:00.000Z INFO chatgpt_turn_started "
+                + "payload.message=\"session_id=\(leakedSessionID)\""
+        )
+        defer { fixture.remove() }
+
+        let result = await DesktopLogSource(logDirectory: fixture.directoryURL).poll(since: nil)
+        let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+
+        XCTAssertTrue(result.events.isEmpty)
+        XCTAssertEqual(result.health.status, .degraded)
+        XCTAssertEqual(result.health.issues.count, 1)
+        guard case let .malformedLine(path, lineNumber) = try XCTUnwrap(
+            result.health.issues.first
+        ) else {
+            return XCTFail("Expected one malformed line issue")
+        }
+        XCTAssertEqual(URL(fileURLWithPath: path).lastPathComponent, fixture.fileURL.lastPathComponent)
+        XCTAssertEqual(lineNumber, 1)
+        XCTAssertFalse(encoded.contains(leakedSessionID))
+    }
 }
 
 private struct TemporaryDesktopLogFixture {
@@ -118,6 +159,14 @@ private struct TemporaryDesktopLogFixture {
                 subdirectory: "Fixtures"
             ) ?? Bundle.module.url(forResource: "desktop-log-v1", withExtension: "log")
         )
+        return try make(contents: Data(contentsOf: resourceURL))
+    }
+
+    static func singleLine(_ line: String) throws -> TemporaryDesktopLogFixture {
+        try make(contents: Data((line + "\n").utf8))
+    }
+
+    private static func make(contents: Data) throws -> TemporaryDesktopLogFixture {
         let directoryURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("DesktopLogSourceTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
@@ -125,7 +174,7 @@ private struct TemporaryDesktopLogFixture {
             withIntermediateDirectories: true
         )
         let fileURL = directoryURL.appendingPathComponent("desktop.log")
-        try Data(contentsOf: resourceURL).write(to: fileURL)
+        try contents.write(to: fileURL)
         return TemporaryDesktopLogFixture(directoryURL: directoryURL, fileURL: fileURL)
     }
 
