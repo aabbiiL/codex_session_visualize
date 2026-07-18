@@ -4,9 +4,9 @@ import XCTest
 
 final class AppServerTransportTests: XCTestCase {
     func testUnixWebSocketTransportUpgradesFramesAndReusesOneConnectionForSourceHandshake() async throws {
-        let initializeResponse = Data(
-            "{\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-01\"}}".utf8
-        )
+        let initializeJSON = "{\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-01\","
+            + "\"userAgent\":\"codex-session-monitor/0.144.0 (Mac OS 14.0; arm64)\"}}"
+        let initializeResponse = Data(initializeJSON.utf8)
         let threadListResponse = Data(
             "{\"id\":3,\"result\":{\"data\":[],\"nextCursor\":null}}".utf8
         )
@@ -99,11 +99,17 @@ final class AppServerTransportTests: XCTestCase {
     }
 
     func testDifferentIDServerRequestIsDiscardedWithoutPoisoningClientResponses() async throws {
-        try await assertInterleavedServerRequestIsDiscarded(serverRequestID: 77)
+        try await assertInterleavedServerRequestIsDiscarded(serverRequestIDJSON: "77")
     }
 
     func testCollidingIDServerRequestIsDiscardedWithoutBecomingClientResponse() async throws {
-        try await assertInterleavedServerRequestIsDiscarded(serverRequestID: 1)
+        try await assertInterleavedServerRequestIsDiscarded(serverRequestIDJSON: "1")
+    }
+
+    func testStringIDServerRequestIsDiscardedWithoutPoisoningIntegerClientResponses() async throws {
+        try await assertInterleavedServerRequestIsDiscarded(
+            serverRequestIDJSON: #""server-request-1""#
+        )
     }
 
     func testMatchingErrorResponseThrowsTypedContentFreeErrorWithoutResettingConnection() async throws {
@@ -145,8 +151,8 @@ final class AppServerTransportTests: XCTestCase {
         XCTAssertFalse(retainedDescription.contains(secretData))
     }
 
-    func testResponseIDsRejectBooleanFractionalAndStringLookalikes() async throws {
-        for invalidID in ["true", "1.5", "\"1\""] {
+    func testResponseIDsRejectBooleanAndFractionalLookalikes() async throws {
+        for invalidID in ["true", "1.5"] {
             let stream = ScriptedUnixSocketByteStream(reads: [
                 upgradeResponse(),
                 serverTextFrame(Data("{\"id\":\(invalidID),\"result\":{}}".utf8)),
@@ -165,6 +171,71 @@ final class AppServerTransportTests: XCTestCase {
                 XCTAssertEqual(error as? AppServerTransportFailure, .protocolViolation)
             }
         }
+    }
+
+    func testStringClientResponseIDRemainsAProtocolViolation() async throws {
+        let stream = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(Data(#"{"id":"1","result":{}}"#.utf8)),
+        ])
+        let transport = makeTransport(
+            factory: RecordingUnixSocketByteStreamFactory(stream: stream)
+        )
+
+        do {
+            _ = try await transport.request(
+                Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+                at: transportEndpoint()
+            )
+            XCTFail("A client response ID must remain an exact integer")
+        } catch {
+            XCTAssertEqual(error as? AppServerTransportFailure, .protocolViolation)
+        }
+    }
+
+    func testInterleavedServerRequestFloodIsBoundedAndResetsWithoutRetainingContent() async throws {
+        let secret = "FIXTURE_FLOOD_SECRET"
+        let maximum = UnixWebSocketAppServerTransport.maximumInterleavedServerRequests
+        guard (1...64).contains(maximum) else {
+            XCTFail("The interleaved request bound must stay within 1...64")
+            return
+        }
+        let serverRequests = (0...maximum).map { index in
+            let json = "{\"id\":\(1_000 + index),\"method\":\"server/request\","
+                + "\"params\":{\"secret\":\"\(secret)\"}}"
+            return serverTextFrame(Data(json.utf8))
+        }
+        let first = ScriptedUnixSocketByteStream(
+            reads: [upgradeResponse()] + serverRequests
+        )
+        let expected = Data(#"{"id":2,"result":{"ok":true}}"#.utf8)
+        let second = ScriptedUnixSocketByteStream(reads: [
+            upgradeResponse(), serverTextFrame(expected),
+        ])
+        let factory = SequencedUnixSocketByteStreamFactory(streams: [first, second])
+        let transport = makeTransport(factory: factory)
+        var caught: AppServerTransportFailure?
+
+        do {
+            _ = try await transport.request(
+                Data(#"{"id":1,"method":"fixture/request","params":{}}"#.utf8),
+                at: transportEndpoint()
+            )
+            XCTFail("Interleaved server requests must have a deterministic bound")
+        } catch let error as AppServerTransportFailure {
+            caught = error
+        }
+        let returned = try await transport.request(
+            Data(#"{"id":2,"method":"fixture/request","params":{}}"#.utf8),
+            at: transportEndpoint()
+        )
+        let connectionCount = await factory.connectionCount()
+        let externallyRetained = String(describing: caught)
+            + String(decoding: returned, as: UTF8.self)
+
+        XCTAssertEqual(caught, .protocolViolation)
+        XCTAssertEqual(returned, expected)
+        XCTAssertEqual(connectionCount, 2)
+        XCTAssertFalse(externallyRetained.contains(secret))
     }
 
     func testPingBeforeResponseSendsMaskedPongAndFragmentedTextIsReassembled() async throws {
@@ -221,9 +292,11 @@ final class AppServerTransportTests: XCTestCase {
     }
 
 
-    private func assertInterleavedServerRequestIsDiscarded(serverRequestID: Int) async throws {
+    private func assertInterleavedServerRequestIsDiscarded(
+        serverRequestIDJSON: String
+    ) async throws {
         let secret = "FIXTURE_REQ_SECRET"
-        let serverRequestJSON = "{\"id\":\(serverRequestID),\"method\":\"server/request\","
+        let serverRequestJSON = "{\"id\":\(serverRequestIDJSON),\"method\":\"server/request\","
             + "\"params\":{\"secret\":\"\(secret)\"}}"
         let serverRequest = Data(serverRequestJSON.utf8)
         let firstResponse = Data(#"{"id":1,"result":{"sequence":1}}"#.utf8)

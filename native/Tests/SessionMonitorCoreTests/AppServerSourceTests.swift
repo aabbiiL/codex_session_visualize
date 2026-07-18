@@ -259,7 +259,9 @@ private func jsonObject(_ data: Data) throws -> [String: Any] {
 }
 
 private func initializeResponse(id: Int, version: String = "2026-07-01") -> Data {
-    Data("{\"id\":\(id),\"result\":{\"protocolVersion\":\"\(version)\"}}".utf8)
+    let result = "{\"id\":\(id),\"result\":{\"protocolVersion\":\"\(version)\","
+        + "\"userAgent\":\"codex-session-monitor/0.144.0 (Mac OS 14.0; arm64)\"}}"
+    return Data(result.utf8)
 }
 
 private func listResponse(id: Int) -> Data {

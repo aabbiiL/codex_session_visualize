@@ -1,4 +1,4 @@
-{"id":1,"result":{"protocolVersion":"2026-07-01"}}
+{"id":1,"result":{"protocolVersion":"2026-07-01","userAgent":"codex-session-monitor/0.144.0 (Mac OS 14.0; arm64)"}}
 {"id":2,"result":{"data":[],"nextCursor":null}}
 {"id":3,"result":{"data":[{"id":"thread-from-list","status":{"type":"active","activeFlags":[]}}],"nextCursor":null}}
 {"method":"thread/status/changed","params":{"threadId":"thread-approval","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}
