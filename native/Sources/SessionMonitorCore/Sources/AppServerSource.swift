@@ -1,4 +1,5 @@
 import CryptoKit
+import CoreFoundation
 import Darwin
 import Foundation
 
@@ -6,6 +7,11 @@ public protocol AppServerTransport: Sendable {
     func request(_ payload: Data, at endpoint: AppServerEndpoint) async throws -> Data
     func notify(_ payload: Data, at endpoint: AppServerEndpoint) async throws
     func drainNotifications(at endpoint: AppServerEndpoint) async throws -> [Data]
+    func reset() async
+}
+
+public extension AppServerTransport {
+    func reset() async {}
 }
 
 public protocol UnixSocketByteStream: Sendable {
@@ -40,13 +46,16 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
     private var stream: (any UnixSocketByteStream)?
     private var connectedEndpoint: AppServerEndpoint?
     private var inbound = Data()
+    private var fragmentedText: Data?
+    private var queuedNotifications: [Data] = []
+    private var queuedNotificationBytes = 0
 
     public init(
         streamFactory: any UnixSocketByteStreamFactory = DarwinUnixSocketByteStreamFactory()
     ) {
         self.streamFactory = streamFactory
-        self.webSocketKeyGenerator = Self.randomWebSocketKey
-        self.maskKeyGenerator = Self.randomMaskKey
+        self.webSocketKeyGenerator = { @Sendable in Self.randomWebSocketKey() }
+        self.maskKeyGenerator = { @Sendable in Self.randomMaskKey() }
     }
 
     public init(
@@ -60,46 +69,77 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
     }
 
     public func request(_ payload: Data, at endpoint: AppServerEndpoint) async throws -> Data {
-        try await ensureConnected(to: endpoint)
-        try await sendText(payload)
-        guard let response = try await nextServerTextMessage(waitForData: true) else {
-            throw AppServerTransportFailure.connectionClosed
+        do {
+            let requestID = try exactIntegerID(in: payload)
+            try await ensureConnected(to: endpoint)
+            try await sendText(payload)
+            while true {
+                guard let message = try await nextServerTextMessage(waitForData: true) else {
+                    throw AppServerTransportFailure.connectionClosed
+                }
+                let envelope = try wireEnvelope(message)
+                if envelope.method != nil, envelope.id == nil {
+                    try enqueueNotification(message)
+                    continue
+                }
+                guard envelope.id == requestID else {
+                    throw AppServerTransportFailure.protocolViolation
+                }
+                return message
+            }
+        } catch {
+            await resetConnection()
+            throw error
         }
-        return response
     }
 
     public func notify(_ payload: Data, at endpoint: AppServerEndpoint) async throws {
-        try await ensureConnected(to: endpoint)
-        try await sendText(payload)
+        do {
+            try await ensureConnected(to: endpoint)
+            try await sendText(payload)
+        } catch {
+            await resetConnection()
+            throw error
+        }
     }
 
     public func drainNotifications(at endpoint: AppServerEndpoint) async throws -> [Data] {
-        try await ensureConnected(to: endpoint)
-        var messages: [Data] = []
-        var totalBytes = 0
-        while messages.count < Self.maximumDrainedNotifications {
-            guard let message = try await nextServerTextMessage(waitForData: false) else {
-                break
+        do {
+            try await ensureConnected(to: endpoint)
+            var messages = queuedNotifications
+            queuedNotifications.removeAll(keepingCapacity: true)
+            queuedNotificationBytes = 0
+            var totalBytes = messages.reduce(0) { $0 + $1.count }
+            while messages.count < Self.maximumDrainedNotifications {
+                guard let message = try await nextServerTextMessage(waitForData: false) else {
+                    break
+                }
+                let envelope = try wireEnvelope(message)
+                guard envelope.method != nil, envelope.id == nil else {
+                    throw AppServerTransportFailure.protocolViolation
+                }
+                totalBytes += message.count
+                guard totalBytes <= Self.maximumMessageBytes else {
+                    throw AppServerTransportFailure.messageTooLarge
+                }
+                messages.append(message)
             }
-            totalBytes += message.count
-            guard totalBytes <= Self.maximumMessageBytes else {
-                throw AppServerTransportFailure.messageTooLarge
-            }
-            messages.append(message)
+            return messages
+        } catch {
+            await resetConnection()
+            throw error
         }
-        return messages
+    }
+
+    public func reset() async {
+        await resetConnection()
     }
 
     private func ensureConnected(to endpoint: AppServerEndpoint) async throws {
         if stream != nil, connectedEndpoint == endpoint {
             return
         }
-        if let stream {
-            await stream.close()
-        }
-        stream = nil
-        connectedEndpoint = nil
-        inbound.removeAll(keepingCapacity: false)
+        await resetConnection()
 
         guard case let .unixWebSocket(socketURL, requestPath) = endpoint,
               requestPath.hasPrefix("/") else {
@@ -178,6 +218,10 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
     }
 
     private func sendText(_ payload: Data) async throws {
+        try await sendFrame(opcode: 0x1, payload: payload)
+    }
+
+    private func sendFrame(opcode: UInt8, payload: Data) async throws {
         guard payload.count <= Self.maximumMessageBytes else {
             throw AppServerTransportFailure.messageTooLarge
         }
@@ -189,7 +233,7 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
             throw AppServerTransportFailure.protocolViolation
         }
 
-        var frame = Data([0x81])
+        var frame = Data([0x80 | opcode])
         if payload.count < 126 {
             frame.append(UInt8(payload.count) | 0x80)
         } else if payload.count <= Int(UInt16.max) {
@@ -214,8 +258,37 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
         }
         var emptyReads = 0
         while true {
-            if let message = try parseServerTextFrame() {
-                return message
+            if let frame = try parseServerFrame() {
+                switch frame.opcode {
+                case 0x1:
+                    guard fragmentedText == nil else {
+                        throw AppServerTransportFailure.protocolViolation
+                    }
+                    if frame.final { return frame.payload }
+                    fragmentedText = frame.payload
+                case 0x0:
+                    guard fragmentedText != nil else {
+                        throw AppServerTransportFailure.protocolViolation
+                    }
+                    fragmentedText?.append(frame.payload)
+                    guard (fragmentedText?.count ?? 0) <= Self.maximumMessageBytes else {
+                        throw AppServerTransportFailure.messageTooLarge
+                    }
+                    if frame.final {
+                        let message = fragmentedText
+                        fragmentedText = nil
+                        return message
+                    }
+                case 0x9:
+                    try await sendFrame(opcode: 0xA, payload: frame.payload)
+                case 0xA:
+                    continue
+                case 0x8:
+                    await resetConnection()
+                    throw AppServerTransportFailure.connectionClosed
+                default:
+                    throw AppServerTransportFailure.protocolViolation
+                }
             }
             let chunk = try await stream.read(maxBytes: 65_536)
             if chunk.isEmpty {
@@ -234,15 +307,14 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
         }
     }
 
-    private func parseServerTextFrame() throws -> Data? {
+    private func parseServerFrame() throws -> WebSocketFrame? {
         guard inbound.count >= 2 else { return nil }
         let bytes = [UInt8](inbound)
         let first = bytes[0]
         let second = bytes[1]
-        guard first & 0x80 != 0,
-              first & 0x70 == 0,
-              first & 0x0F == 0x01,
-              second & 0x80 == 0 else {
+        let final = first & 0x80 != 0
+        let opcode = first & 0x0F
+        guard first & 0x70 == 0, second & 0x80 == 0 else {
             throw AppServerTransportFailure.protocolViolation
         }
 
@@ -268,11 +340,70 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
         guard payloadLength <= UInt64(Self.maximumMessageBytes) else {
             throw AppServerTransportFailure.messageTooLarge
         }
+        if opcode >= 0x8, (!final || payloadLength > 125) {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        guard [0x0, 0x1, 0x8, 0x9, 0xA].contains(opcode) else {
+            throw AppServerTransportFailure.protocolViolation
+        }
         let totalLength = headerLength + Int(payloadLength)
         guard bytes.count >= totalLength else { return nil }
         let payload = Data(bytes[headerLength..<totalLength])
         inbound.removeFirst(totalLength)
-        return payload
+        return WebSocketFrame(final: final, opcode: opcode, payload: payload)
+    }
+
+    private func exactIntegerID(in data: Data) throws -> Int {
+        let envelope = try wireEnvelope(data)
+        guard let id = envelope.id else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        return id
+    }
+
+    private func wireEnvelope(_ data: Data) throws -> WireEnvelope {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AppServerTransportFailure.protocolViolation
+        }
+        let method = object["method"] as? String
+        let id: Int?
+        if let rawID = object["id"] {
+            guard let number = rawID as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  !Self.isFloatingPointNumber(number),
+                  number.int64Value >= Int64(Int.min),
+                  number.int64Value <= Int64(Int.max) else {
+                throw AppServerTransportFailure.protocolViolation
+            }
+            id = Int(number.int64Value)
+        } else {
+            id = nil
+        }
+        return WireEnvelope(method: method, id: id)
+    }
+
+    private static func isFloatingPointNumber(_ number: NSNumber) -> Bool {
+        let type = String(cString: number.objCType)
+        return type == "f" || type == "d"
+    }
+
+    private func enqueueNotification(_ data: Data) throws {
+        guard queuedNotifications.count < Self.maximumDrainedNotifications,
+              queuedNotificationBytes + data.count <= Self.maximumMessageBytes else {
+            throw AppServerTransportFailure.messageTooLarge
+        }
+        queuedNotifications.append(data)
+        queuedNotificationBytes += data.count
+    }
+
+    private func resetConnection() async {
+        if let stream { await stream.close() }
+        stream = nil
+        connectedEndpoint = nil
+        inbound.removeAll(keepingCapacity: false)
+        fragmentedText = nil
+        queuedNotifications.removeAll(keepingCapacity: false)
+        queuedNotificationBytes = 0
     }
 
     private func expectedAccept(for key: String) -> String {
@@ -290,136 +421,200 @@ public actor UnixWebSocketAppServerTransport: AppServerTransport {
     }
 }
 
-public struct DarwinUnixSocketByteStreamFactory: UnixSocketByteStreamFactory, Sendable {
+private struct WebSocketFrame {
+    let final: Bool
+    let opcode: UInt8
+    let payload: Data
+}
+
+private struct WireEnvelope {
+    let method: String?
+    let id: Int?
+}
+
+public protocol DarwinUnixSocketSyscalls: Sendable {
+    func openConnectedUnixSocket(path: String) throws -> Int32
+    func setSocketOption(
+        descriptor: Int32,
+        level: Int32,
+        name: Int32,
+        value: Int32
+    ) throws
+    func receive(descriptor: Int32, maxBytes: Int) throws -> Data
+    func send(descriptor: Int32, data: Data) throws -> Int
+    func close(descriptor: Int32)
+}
+
+public struct DarwinUnixSocketSystemCalls: DarwinUnixSocketSyscalls, Sendable {
     public init() {}
 
-    public func open(socketURL: URL) async throws -> any UnixSocketByteStream {
+    public func openConnectedUnixSocket(path: String) throws -> Int32 {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else {
-            throw AppServerTransportFailure.socketUnavailable
-        }
+        guard descriptor >= 0 else { throw POSIXError(.EMFILE) }
+        do {
+            try setSocketOption(
+                descriptor: descriptor,
+                level: SOL_SOCKET,
+                name: SO_NOSIGPIPE,
+                value: 1
+            )
+            var timeout = timeval(tv_sec: 0, tv_usec: 100_000)
+            guard Darwin.setsockopt(
+                descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                socklen_t(MemoryLayout<timeval>.size)
+            ) == 0,
+            Darwin.setsockopt(
+                descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                socklen_t(MemoryLayout<timeval>.size)
+            ) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL)
+            }
 
-        var address = sockaddr_un()
-        let pathBytes = Array(socketURL.standardizedFileURL.path.utf8CString)
-        guard pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(descriptor)
-            throw AppServerTransportFailure.invalidEndpoint
-        }
-        address.sun_family = sa_family_t(AF_UNIX)
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
-        address.sun_len = UInt8(length)
-        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { target in
-                for (index, byte) in pathBytes.enumerated() {
-                    target[index] = byte
+            var address = sockaddr_un()
+            let pathBytes = Array(path.utf8CString)
+            guard pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+                throw POSIXError(.ENAMETOOLONG)
+            }
+            address.sun_family = sa_family_t(AF_UNIX)
+            let length = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
+            address.sun_len = UInt8(length)
+            withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { target in
+                    for (index, byte) in pathBytes.enumerated() { target[index] = byte }
                 }
             }
-        }
-
-        let connectResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(descriptor, $0, length)
+            let connected = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(descriptor, $0, length)
+                }
             }
-        }
-        guard connectResult == 0 else {
-            let error = errno
+            guard connected == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ECONNREFUSED)
+            }
+            return descriptor
+        } catch {
             Darwin.close(descriptor)
-            throw AppServerTransportFailure.ioFailure(error)
+            throw error
         }
+    }
 
-        var timeout = timeval(tv_sec: 0, tv_usec: 100_000)
-        _ = withUnsafePointer(to: &timeout) {
-            Darwin.setsockopt(
-                descriptor,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                $0,
-                socklen_t(MemoryLayout<timeval>.size)
-            )
+    public func setSocketOption(
+        descriptor: Int32,
+        level: Int32,
+        name: Int32,
+        value: Int32
+    ) throws {
+        var value = value
+        guard Darwin.setsockopt(
+            descriptor, level, name, &value, socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL)
         }
-        _ = withUnsafePointer(to: &timeout) {
-            Darwin.setsockopt(
-                descriptor,
-                SOL_SOCKET,
-                SO_SNDTIMEO,
-                $0,
-                socklen_t(MemoryLayout<timeval>.size)
-            )
+    }
+
+    public func receive(descriptor: Int32, maxBytes: Int) throws -> Data {
+        var buffer = [UInt8](repeating: 0, count: maxBytes)
+        let count = buffer.withUnsafeMutableBytes {
+            Darwin.recv(descriptor, $0.baseAddress, maxBytes, 0)
         }
-        return DarwinUnixSocketByteStream(descriptor: descriptor)
+        if count > 0 { return Data(buffer.prefix(count)) }
+        if count == 0 { throw AppServerTransportFailure.connectionClosed }
+        if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { return Data() }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    public func send(descriptor: Int32, data: Data) throws -> Int {
+        let count = data.withUnsafeBytes {
+            Darwin.send(descriptor, $0.baseAddress, data.count, 0)
+        }
+        guard count >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return count
+    }
+
+    public func close(descriptor: Int32) { Darwin.close(descriptor) }
+}
+
+public struct DarwinUnixSocketByteStreamFactory: UnixSocketByteStreamFactory, Sendable {
+    private let syscalls: any DarwinUnixSocketSyscalls
+
+    public init(syscalls: any DarwinUnixSocketSyscalls = DarwinUnixSocketSystemCalls()) {
+        self.syscalls = syscalls
+    }
+
+    public func open(socketURL: URL) async throws -> any UnixSocketByteStream {
+        let descriptor = try syscalls.openConnectedUnixSocket(
+            path: socketURL.standardizedFileURL.path
+        )
+        do {
+            try syscalls.setSocketOption(
+                descriptor: descriptor,
+                level: SOL_SOCKET,
+                name: SO_NOSIGPIPE,
+                value: 1
+            )
+            return DarwinUnixSocketByteStream(descriptor: descriptor, syscalls: syscalls)
+        } catch {
+            syscalls.close(descriptor: descriptor)
+            throw error
+        }
     }
 }
 
 public final class DarwinUnixSocketByteStream: UnixSocketByteStream, @unchecked Sendable {
     private let lock = NSLock()
+    private let syscalls: any DarwinUnixSocketSyscalls
     private var descriptor: Int32
 
-    init(descriptor: Int32) {
+    init(descriptor: Int32, syscalls: any DarwinUnixSocketSyscalls) {
         self.descriptor = descriptor
+        self.syscalls = syscalls
     }
 
-    deinit {
-        closeDescriptor()
-    }
+    deinit { closeDescriptor() }
 
     public func read(maxBytes: Int) async throws -> Data {
         guard maxBytes > 0 else { return Data() }
         return try lock.withLock {
-            guard descriptor >= 0 else {
+            guard descriptor >= 0 else { throw AppServerTransportFailure.connectionClosed }
+            do {
+                return try syscalls.receive(descriptor: descriptor, maxBytes: maxBytes)
+            } catch let error as POSIXError where Self.isDisconnected(error.code) {
                 throw AppServerTransportFailure.connectionClosed
             }
-            var buffer = [UInt8](repeating: 0, count: maxBytes)
-            let count = buffer.withUnsafeMutableBytes {
-                Darwin.recv(descriptor, $0.baseAddress, maxBytes, 0)
-            }
-            if count > 0 {
-                return Data(buffer.prefix(count))
-            }
-            if count == 0 {
-                throw AppServerTransportFailure.connectionClosed
-            }
-            if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
-                return Data()
-            }
-            throw AppServerTransportFailure.ioFailure(errno)
         }
     }
 
     public func write(_ data: Data) async throws {
         try lock.withLock {
-            guard descriptor >= 0 else {
-                throw AppServerTransportFailure.connectionClosed
-            }
-            var written = 0
-            try data.withUnsafeBytes { rawBuffer in
-                while written < data.count {
-                    let count = Darwin.send(
-                        descriptor,
-                        rawBuffer.baseAddress?.advanced(by: written),
-                        data.count - written,
-                        0
-                    )
-                    if count > 0 {
-                        written += count
-                    } else if count < 0, errno == EINTR {
-                        continue
-                    } else {
-                        throw AppServerTransportFailure.ioFailure(errno)
+            guard descriptor >= 0 else { throw AppServerTransportFailure.connectionClosed }
+            var remaining = data
+            while !remaining.isEmpty {
+                do {
+                    let written = try syscalls.send(descriptor: descriptor, data: remaining)
+                    guard written > 0, written <= remaining.count else {
+                        throw AppServerTransportFailure.connectionClosed
                     }
+                    remaining.removeFirst(written)
+                } catch let error as POSIXError where Self.isDisconnected(error.code) {
+                    throw AppServerTransportFailure.connectionClosed
                 }
             }
         }
     }
 
-    public func close() async {
-        lock.withLock { closeDescriptor() }
-    }
+    public func close() async { lock.withLock { closeDescriptor() } }
 
     private func closeDescriptor() {
         if descriptor >= 0 {
-            Darwin.close(descriptor)
+            syscalls.close(descriptor: descriptor)
             descriptor = -1
         }
+    }
+
+    private static func isDisconnected(_ code: POSIXErrorCode) -> Bool {
+        code == .EPIPE || code == .ECONNRESET || code == .ENOTCONN
     }
 }
 
@@ -445,24 +640,46 @@ public struct AppServerReconnectBackoff: Hashable, Sendable {
     }
 }
 
-public struct AppServerSource: EventSource {
+public actor AppServerSource: EventSource {
     public static let supportedProtocolVersion = "2026-07-01"
 
-    public let id: EvidenceSource = .appServer
+    public nonisolated let id: EvidenceSource = .appServer
     private let endpoint: AppServerEndpoint?
     private let transport: any AppServerTransport
     private let diagnosticConnectionProbe: ConnectionProbe?
+    private let reconnectBackoff: AppServerReconnectBackoff
+    private let reconnectSleeper: @Sendable (Int) async -> Void
     private let now: @Sendable () -> Date
+    private var initialized = false
+    private var nextRequestID = 1
+    private var subscribedThreadIDs = Set<String>()
+    private var structuralSnapshot: [String: ObservedEvent.Kind] = [:]
+    private var consecutiveFailures = 0
+
+    private static let allSourceKinds = [
+        "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+        "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+    ]
 
     public init(
         endpoint: AppServerEndpoint?,
         transport: (any AppServerTransport)? = nil,
         diagnosticConnectionProbe: ConnectionProbe? = nil,
+        reconnectBackoff: AppServerReconnectBackoff = AppServerReconnectBackoff(
+            baseDelayMilliseconds: 250,
+            maximumDelayMilliseconds: 2_000
+        ),
+        reconnectSleeper: @escaping @Sendable (Int) async -> Void = { milliseconds in
+            guard milliseconds > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+        },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.endpoint = endpoint
         self.transport = transport ?? UnixWebSocketAppServerTransport()
         self.diagnosticConnectionProbe = diagnosticConnectionProbe
+        self.reconnectBackoff = reconnectBackoff
+        self.reconnectSleeper = reconnectSleeper
         self.now = now
     }
 
@@ -471,45 +688,52 @@ public struct AppServerSource: EventSource {
             return SourcePollResult(health: SourceHealth(status: .unavailable))
         }
         do {
-            let initialize = try wireMessage(
-                method: "initialize",
-                id: 1,
-                params: [
-                    "clientInfo": [
-                        "name": "codex-session-monitor",
-                        "version": "1.0",
-                    ],
-                ]
-            )
-            let initializeResponse = try await transport.request(initialize, at: endpoint)
-            let initializeResult = try responseResult(initializeResponse, expectedID: 1)
-            if let version = initializeResult["protocolVersion"],
-               !(version is NSNull),
-               (version as? String) != Self.supportedProtocolVersion {
-                return unavailable(issue: .appServerProtocol(.unsupportedVersion))
+            if consecutiveFailures > 0 {
+                await reconnectSleeper(
+                    reconnectBackoff.delayMilliseconds(
+                        afterFailureCount: consecutiveFailures
+                    )
+                )
+            }
+            try await initializeIfNeeded(endpoint: endpoint)
+            let loadedThreadIDs = try await loadedThreads(endpoint: endpoint)
+            for threadID in loadedThreadIDs where !subscribedThreadIDs.contains(threadID) {
+                _ = try await request(
+                    method: "thread/resume",
+                    params: ["threadId": threadID],
+                    endpoint: endpoint
+                )
+                subscribedThreadIDs.insert(threadID)
             }
 
-            try await transport.notify(
-                wireMessage(method: "initialized", id: nil, params: [:]),
-                at: endpoint
-            )
-            let listResponse = try await transport.request(
-                wireMessage(method: "thread/list", id: 2, params: ["limit": 100]),
-                at: endpoint
-            )
-            let listResult = try responseResult(listResponse, expectedID: 2)
+            let threads = try await listedThreads(endpoint: endpoint)
             let observedAt = now()
-            var events = eventsFromThreadList(listResult, observedAt: observedAt)
+            let currentSnapshot = snapshotKinds(threads)
+            var events = currentSnapshot.compactMap { sessionID, kind -> RawSourceEvent? in
+                guard structuralSnapshot[sessionID] != kind else { return nil }
+                return rawEvent(
+                    sessionID: sessionID,
+                    turnID: nil,
+                    itemID: nil,
+                    kind: kind,
+                    observedAt: observedAt
+                )
+            }.sorted { $0.sessionID < $1.sessionID }
+            structuralSnapshot = currentSnapshot
             var malformed = false
             for data in try await transport.drainNotifications(at: endpoint) {
                 do {
                     if let event = try eventFromNotification(data, observedAt: observedAt) {
                         events.append(event)
+                        if event.turnID == nil, event.itemID == nil {
+                            structuralSnapshot[event.sessionID] = event.kind
+                        }
                     }
                 } catch {
                     malformed = true
                 }
             }
+            consecutiveFailures = 0
             return SourcePollResult(
                 events: events,
                 health: SourceHealth(
@@ -517,13 +741,104 @@ public struct AppServerSource: EventSource {
                     issues: malformed ? [.appServerProtocol(.malformedMessage)] : []
                 )
             )
-        } catch AppServerSourceFailure.responseIDMismatch {
-            return unavailable(issue: .appServerProtocol(.responseIDMismatch))
-        } catch AppServerSourceFailure.malformedMessage {
-            return unavailable(issue: .appServerProtocol(.malformedMessage))
         } catch {
+            await resetAfterFailure()
+            if case AppServerSourceFailure.responseIDMismatch = error {
+                return unavailable(issue: .appServerProtocol(.responseIDMismatch))
+            }
+            if case AppServerSourceFailure.unsupportedVersion = error {
+                return unavailable(issue: .appServerProtocol(.unsupportedVersion))
+            }
+            if case AppServerSourceFailure.malformedMessage = error {
+                return unavailable(issue: .appServerProtocol(.malformedMessage))
+            }
             return unavailable(issue: .appServerProtocol(.transportViolation))
         }
+    }
+
+    private func initializeIfNeeded(endpoint: AppServerEndpoint) async throws {
+        guard !initialized else { return }
+        let result = try await request(
+            method: "initialize",
+            params: [
+                "clientInfo": [
+                    "name": "codex-session-monitor",
+                    "version": "1.0",
+                ],
+            ],
+            endpoint: endpoint
+        )
+        if let version = result["protocolVersion"],
+           !(version is NSNull),
+           (version as? String) != Self.supportedProtocolVersion {
+            throw AppServerSourceFailure.unsupportedVersion
+        }
+        try await transport.notify(
+            wireMessage(method: "initialized", id: nil, params: [:]),
+            at: endpoint
+        )
+        initialized = true
+    }
+
+    private func loadedThreads(endpoint: AppServerEndpoint) async throws -> [String] {
+        var cursor: String?
+        var result: [String] = []
+        repeat {
+            var params: [String: Any] = ["limit": 100]
+            if let cursor { params["cursor"] = cursor }
+            let page = try await request(
+                method: "thread/loaded/list",
+                params: params,
+                endpoint: endpoint
+            )
+            if let ids = page["data"] as? [String] { result.append(contentsOf: ids) }
+            cursor = page["nextCursor"] as? String
+        } while cursor != nil
+        return result
+    }
+
+    private func listedThreads(endpoint: AppServerEndpoint) async throws -> [[String: Any]] {
+        var cursor: String?
+        var result: [[String: Any]] = []
+        repeat {
+            var params: [String: Any] = [
+                "limit": 100,
+                "sourceKinds": Self.allSourceKinds,
+            ]
+            if let cursor { params["cursor"] = cursor }
+            let page = try await request(
+                method: "thread/list",
+                params: params,
+                endpoint: endpoint
+            )
+            if let threads = page["data"] as? [[String: Any]] {
+                result.append(contentsOf: threads)
+            }
+            cursor = page["nextCursor"] as? String
+        } while cursor != nil
+        return result
+    }
+
+    private func request(
+        method: String,
+        params: [String: Any],
+        endpoint: AppServerEndpoint
+    ) async throws -> [String: Any] {
+        let requestID = nextRequestID
+        nextRequestID += 1
+        let response = try await transport.request(
+            wireMessage(method: method, id: requestID, params: params),
+            at: endpoint
+        )
+        return try responseResult(response, expectedID: requestID)
+    }
+
+    private func resetAfterFailure() async {
+        await transport.reset()
+        initialized = false
+        nextRequestID = 1
+        subscribedThreadIDs.removeAll(keepingCapacity: false)
+        consecutiveFailures = min(consecutiveFailures + 1, 30)
     }
 
     private func unavailable(issue: SourceIssue) -> SourcePollResult {
@@ -547,9 +862,14 @@ public struct AppServerSource: EventSource {
 
     private func responseResult(_ data: Data, expectedID: Int) throws -> [String: Any] {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let responseID = (object["id"] as? NSNumber)?.intValue else {
+              let number = object["id"] as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !Self.isFloatingPointNumber(number),
+              number.int64Value >= Int64(Int.min),
+              number.int64Value <= Int64(Int.max) else {
             throw AppServerSourceFailure.malformedMessage
         }
+        let responseID = Int(number.int64Value)
         guard responseID == expectedID else {
             throw AppServerSourceFailure.responseIDMismatch
         }
@@ -559,25 +879,22 @@ public struct AppServerSource: EventSource {
         return result
     }
 
-    private func eventsFromThreadList(
-        _ result: [String: Any],
-        observedAt: Date
-    ) -> [RawSourceEvent] {
-        guard let threads = result["data"] as? [[String: Any]] else { return [] }
-        return threads.compactMap { thread in
+    private static func isFloatingPointNumber(_ number: NSNumber) -> Bool {
+        let type = String(cString: number.objCType)
+        return type == "f" || type == "d"
+    }
+
+    private func snapshotKinds(
+        _ threads: [[String: Any]]
+    ) -> [String: ObservedEvent.Kind] {
+        Dictionary(uniqueKeysWithValues: threads.compactMap { thread in
             guard let sessionID = thread["id"] as? String,
                   let status = thread["status"] as? [String: Any],
                   let kind = kindFromThreadStatus(status) else {
                 return nil
             }
-            return rawEvent(
-                sessionID: sessionID,
-                turnID: nil,
-                itemID: nil,
-                kind: kind,
-                observedAt: observedAt
-            )
-        }
+            return (sessionID, kind)
+        })
     }
 
     private func eventFromNotification(
@@ -648,13 +965,24 @@ public struct AppServerSource: EventSource {
                 return Int32(processID)
             }
             let duration = (item["durationMs"] as? NSNumber)?.intValue
+            let kind: ObservedEvent.Kind
+            switch itemType {
+            case "commandExecution", "mcpToolCall":
+                kind = method == "item/started"
+                    ? .toolStarted(processID: processID)
+                    : .modelActivity
+            case "agentMessage", "reasoning", "plan":
+                kind = .modelActivity
+            case "contextCompaction":
+                kind = .contextCompaction
+            default:
+                return nil
+            }
             return rawEvent(
                 sessionID: sessionID,
                 turnID: turnID,
                 itemID: itemID,
-                kind: method == "item/started"
-                    ? .toolStarted(processID: processID)
-                    : .modelActivity,
+                kind: kind,
                 observedAt: observedAt,
                 toolName: whitelistedToolType(itemType),
                 durationMilliseconds: duration
@@ -720,4 +1048,5 @@ public struct AppServerSource: EventSource {
 private enum AppServerSourceFailure: Error {
     case responseIDMismatch
     case malformedMessage
+    case unsupportedVersion
 }
